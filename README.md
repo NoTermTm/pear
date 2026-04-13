@@ -93,3 +93,21 @@ The config file can also use a compact proxy map:
 ```
 
 CLI options override scalar config values such as `port` and `root`. CLI `--proxy` values are appended to proxy rules loaded from the config file.
+
+## Release
+
+GitHub Actions builds release packages for Linux, Windows, and macOS when a version tag is pushed:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow uploads these assets to the GitHub Release:
+
+```text
+pear-linux-x86_64.tar.gz
+pear-windows-x86_64.zip
+pear-macos-x86_64.tar.gz
+pear-macos-aarch64.tar.gz
+```
