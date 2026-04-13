@@ -9,6 +9,7 @@ use std::{
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_CONFIG: &str = "config.toml";
+const SERVER_HEADER: &str = "pear";
 
 #[derive(Debug)]
 struct Config {
@@ -791,6 +792,7 @@ fn write_head_response(
     write!(
         stream,
         "HTTP/1.1 {status} {reason}\r\n\
+         Server: {SERVER_HEADER}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {content_length}\r\n\
          Cache-Control: no-cache\r\n\
