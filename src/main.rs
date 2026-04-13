@@ -524,7 +524,28 @@ fn handle_connection(
     };
 
     if let Some(proxy) = find_proxy(proxies, &request.target) {
-        return proxy_request(&request, proxy, &mut stream);
+        if has_chunked_transfer_encoding(&request) {
+            return write_response(
+                &mut stream,
+                501,
+                "Not Implemented",
+                "text/plain",
+                b"Chunked transfer encoding is not supported",
+            );
+        }
+
+        if let Err(err) = proxy_request(&request, proxy, &mut stream) {
+            eprintln!("Proxy request failed: {err}");
+            return write_response(
+                &mut stream,
+                502,
+                "Bad Gateway",
+                "text/plain",
+                b"Bad Gateway",
+            );
+        }
+
+        return Ok(());
     }
 
     serve_static(request, stream, root, spa_fallback)
@@ -651,6 +672,18 @@ fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
         .iter()
         .find(|(header, _)| header.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.as_str())
+}
+
+fn has_chunked_transfer_encoding(request: &Request) -> bool {
+    request
+        .headers
+        .iter()
+        .filter(|(header, _)| header.eq_ignore_ascii_case("transfer-encoding"))
+        .any(|(_, value)| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        })
 }
 
 fn trim_proxy_prefix(prefix: &str) -> String {
@@ -795,7 +828,7 @@ fn content_type(path: &Path) -> &'static str {
 
 fn print_usage() {
     eprintln!(
-        "Usage: mini-server [OPTIONS] [DIR]\n\n\
+        "Usage: pear [OPTIONS] [DIR]\n\n\
          Options:\n\
            -p, --port <PORT>    Port to listen on, default 8080\n\
            -H, --host <HOST>    Host to bind, default 127.0.0.1\n\
@@ -805,10 +838,10 @@ fn print_usage() {
                --proxy <RULE>    Reverse proxy rule, e.g. /api=http://127.0.0.1:3000\n\
            -h, --help           Show this help\n\n\
          Examples:\n\
-           mini-server\n\
-           mini-server -p 3000\n\
-           mini-server --config config.toml\n\
-           mini-server --proxy /api=http://127.0.0.1:3000 ./dist\n\
-           mini-server --host 0.0.0.0 --port 8080 ./dist"
+           pear\n\
+           pear -p 3000\n\
+           pear --config config.toml\n\
+           pear --proxy /api=http://127.0.0.1:3000 ./dist\n\
+           pear --host 0.0.0.0 --port 8080 ./dist"
     );
 }

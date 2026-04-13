@@ -1,4 +1,4 @@
-# mini-server
+# pear
 
 A small Rust static file server for frontend build output.
 
@@ -14,19 +14,19 @@ Run it inside a frontend `dist` directory:
 
 ```sh
 cd dist
-/path/to/mini-server/target/release/mini-server -p 8080
+/path/to/pear/target/release/pear -p 8080
 ```
 
 Or serve a directory directly:
 
 ```sh
-mini-server --port 8080 ./dist
+pear --port 8080 ./dist
 ```
 
 Serve `dist` and proxy API requests to a backend while the browser still uses the frontend origin:
 
 ```sh
-mini-server --port 8080 --proxy /api=http://127.0.0.1:3000 ./dist
+pear --port 8080 --proxy /api=http://127.0.0.1:3000 ./dist
 ```
 
 Or put the same settings in `config.toml`:
@@ -45,7 +45,7 @@ target = "http://127.0.0.1:3000"
 Then run:
 
 ```sh
-mini-server
+pear
 ```
 
 Open:
@@ -71,7 +71,7 @@ By default, unknown routes fall back to `index.html`, which works well for React
 Proxy rules use `prefix=http://host:port`.
 
 ```sh
-mini-server --proxy /api=http://127.0.0.1:3000 --proxy /upload=http://127.0.0.1:4000 ./dist
+pear --proxy /api=http://127.0.0.1:3000 --proxy /upload=http://127.0.0.1:4000 ./dist
 ```
 
 With `/api=http://127.0.0.1:3000`, a browser request to `http://127.0.0.1:8080/api/users` is forwarded to `http://127.0.0.1:3000/api/users`.
@@ -79,7 +79,7 @@ With `/api=http://127.0.0.1:3000`, a browser request to `http://127.0.0.1:8080/a
 If the upstream target includes a path, that path replaces the matched prefix:
 
 ```sh
-mini-server --proxy /api=http://127.0.0.1:3000/backend ./dist
+pear --proxy /api=http://127.0.0.1:3000/backend ./dist
 ```
 
 Then `/api/users` is forwarded to `/backend/users` on the upstream server.
