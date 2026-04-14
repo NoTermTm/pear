@@ -107,23 +107,34 @@ jobs:
     name: Sync Homebrew Tap
     needs: release
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') && secrets.HOMEBREW_TAP_TOKEN != ''
+    if: startsWith(github.ref, 'refs/tags/')
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
     steps:
+      - name: Skip when Homebrew token is not configured
+        if: env.HOMEBREW_TAP_TOKEN == ''
+        run: |
+          echo "HOMEBREW_TAP_TOKEN is not configured, skipping Homebrew sync"
+          exit 0
+
       - name: Download Artifacts
+        if: env.HOMEBREW_TAP_TOKEN != ''
         uses: actions/download-artifact@v4
         with:
           path: release
           merge-multiple: true
 
       - name: Checkout Homebrew Tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
         uses: actions/checkout@v4
         with:
           repository: ${{ env.HOMEBREW_TAP_REPOSITORY }}
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ env.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
 
       - name: Update Formula
+        if: env.HOMEBREW_TAP_TOKEN != ''
         shell: bash
         env:
           TAG_NAME: ${{ github.ref_name }}
