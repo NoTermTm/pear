@@ -21,6 +21,7 @@ const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 const DEFAULT_MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_AUTO_CONNECTIONS: usize = 16_384;
 const RESERVED_FDS: usize = 128;
+const MIN_CONNECTIONS: usize = 1;
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -205,6 +206,7 @@ impl Config {
             index += 1;
         }
 
+        config.runtime.adjust_to_os_fd_limit();
         config.runtime.validate()?;
         Ok(config)
     }
@@ -364,6 +366,24 @@ impl RuntimeConfig {
         }
         Ok(())
     }
+
+    fn adjust_to_os_fd_limit(&mut self) {
+        let Some(limit) = os_fd_limit() else {
+            return;
+        };
+
+        let capped = limit
+            .saturating_sub(RESERVED_FDS)
+            .clamp(MIN_CONNECTIONS, MAX_AUTO_CONNECTIONS);
+
+        if self.max_connections > capped {
+            eprintln!(
+                "Warning: max_connections={} exceeds OS file descriptor limit {} (reserved {}), capping to {}",
+                self.max_connections, limit, RESERVED_FDS, capped
+            );
+            self.max_connections = capped;
+        }
+    }
 }
 
 fn config_path_from_args(args: &[String]) -> Result<(PathBuf, bool), String> {
@@ -513,7 +533,7 @@ fn default_max_connections() -> usize {
         .map(|limit| limit.saturating_sub(RESERVED_FDS))
         .unwrap_or(DEFAULT_MAX_CONNECTIONS);
 
-    derived.clamp(256, MAX_AUTO_CONNECTIONS)
+    derived.clamp(MIN_CONNECTIONS, MAX_AUTO_CONNECTIONS)
 }
 
 #[cfg(unix)]
@@ -901,6 +921,7 @@ fn proxy_request(
     Ok(Response::with_temp_body(head, temp))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn proxy_request_streaming<W: Write>(
     request: &Request,
     proxy: &ProxyRule,
@@ -1290,6 +1311,7 @@ impl Response {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn stream_response_body<W: Write>(writer: &mut W, body: &mut ResponseBody) -> io::Result<()> {
     match body {
         ResponseBody::Empty => Ok(()),
@@ -1362,11 +1384,6 @@ impl TempBodyFile {
         Ok(())
     }
 
-    fn into_file(mut self) -> io::Result<fs::File> {
-        self.file
-            .take()
-            .ok_or_else(|| io::Error::other("temporary file already taken"))
-    }
 }
 
 impl Read for TempBodyFile {
@@ -2058,6 +2075,12 @@ mod linux {
                         self.connections.insert(fd, conn);
                     }
                     Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) if is_fd_exhausted(&err) => {
+                        eprintln!(
+                            "Accept paused: file descriptor limit reached ({err}). Reduce max_connections or raise ulimit -n."
+                        );
+                        break;
+                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -2556,6 +2579,10 @@ mod linux {
               \r\n",
         );
         let _ = stream.shutdown(Shutdown::Both);
+    }
+
+    fn is_fd_exhausted(err: &io::Error) -> bool {
+        matches!(err.raw_os_error(), Some(23 | 24))
     }
 }
 
