@@ -901,6 +901,7 @@ fn proxy_request(
     Ok(Response::with_temp_body(head, temp))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn proxy_request_streaming<W: Write>(
     request: &Request,
     proxy: &ProxyRule,
@@ -1290,6 +1291,7 @@ impl Response {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn stream_response_body<W: Write>(writer: &mut W, body: &mut ResponseBody) -> io::Result<()> {
     match body {
         ResponseBody::Empty => Ok(()),
@@ -1362,11 +1364,6 @@ impl TempBodyFile {
         Ok(())
     }
 
-    fn into_file(mut self) -> io::Result<fs::File> {
-        self.file
-            .take()
-            .ok_or_else(|| io::Error::other("temporary file already taken"))
-    }
 }
 
 impl Read for TempBodyFile {

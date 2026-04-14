@@ -11,6 +11,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  HOMEBREW_TAP_REPOSITORY: ${{ github.repository_owner }}/homebrew-tap
+  HOMEBREW_FORMULA: pear.rb
 
 jobs:
   build:
@@ -100,3 +102,103 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+
+  brew:
+    name: Sync Homebrew Tap
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && secrets.HOMEBREW_TAP_TOKEN != ''
+
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Checkout Homebrew Tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HOMEBREW_TAP_REPOSITORY }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Formula
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          cd homebrew-tap
+
+          VERSION="${TAG_NAME#v}"
+          ARM_ARCHIVE="pear-macos-aarch64.tar.gz"
+          INTEL_ARCHIVE="pear-macos-x86_64.tar.gz"
+          ARM_URL="https://github.com/${REPO}/releases/download/${TAG_NAME}/${ARM_ARCHIVE}"
+          INTEL_URL="https://github.com/${REPO}/releases/download/${TAG_NAME}/${INTEL_ARCHIVE}"
+          FORMULA_PATH="${HOMEBREW_FORMULA}"
+
+          test -f "../release/${ARM_ARCHIVE}"
+          test -f "../release/${INTEL_ARCHIVE}"
+
+          SHA256_ARM="$(sha256sum "../release/${ARM_ARCHIVE}" | awk '{print $1}')"
+          SHA256_INTEL="$(sha256sum "../release/${INTEL_ARCHIVE}" | awk '{print $1}')"
+
+          ruby - "${FORMULA_PATH}" "${VERSION}" "${ARM_URL}" "${SHA256_ARM}" "${INTEL_URL}" "${SHA256_INTEL}" <<'RUBY'
+          formula_path, version, arm_url, arm_sha, intel_url, intel_sha = ARGV
+          class_name = File.basename(formula_path, ".rb").split(/[_-]/).map(&:capitalize).join
+
+          text =
+            if File.exist?(formula_path)
+              File.read(formula_path)
+            else
+              <<~FORMULA
+                class #{class_name} < Formula
+                  desc "Small Rust static file server for frontend build output"
+                  homepage "https://github.com/#{ENV.fetch("REPO")}"
+                  version "#{version}"
+
+                  on_macos do
+                    if Hardware::CPU.arm?
+                      url "#{arm_url}"
+                      sha256 "#{arm_sha}"
+                    else
+                      url "#{intel_url}"
+                      sha256 "#{intel_sha}"
+                    end
+                  end
+
+                  def install
+                    bin.install "pear"
+                  end
+                end
+              FORMULA
+            end
+
+          text.sub!(/version\s+"[^"]+"/, %(version "#{version}"))
+
+          if text.include?('Hardware::CPU.arm?')
+            text.sub!(/url\s+"[^"]*pear-macos-aarch64\.tar\.gz"/, %(url "#{arm_url}"))
+            text.sub!(/sha256\s+"[0-9a-f]{64}"/, %(sha256 "#{arm_sha}"))
+            text.sub!(/url\s+"[^"]*pear-macos-x86_64\.tar\.gz"/, %(url "#{intel_url}"))
+            text.sub!(/sha256\s+"[0-9a-f]{64}"/, %(sha256 "#{intel_sha}"))
+          else
+            raise "Unsupported formula structure in #{formula_path}"
+          end
+
+          File.write(formula_path, text)
+          RUBY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${FORMULA_PATH}"
+          if git diff --cached --quiet; then
+            echo "No Homebrew formula changes to commit"
+            exit 0
+          fi
+
+          git commit -m "Update pear to ${TAG_NAME}"
+          git push origin HEAD:main
