@@ -2166,7 +2166,7 @@ mod linux {
                 wants_keep_alive(&request) && conn.requests_served + 1 < self.runtime.keep_alive_max
             };
 
-            if let Some(proxy) = find_proxy(&self.proxies, &request.target) {
+            if let Some(proxy) = find_proxy(&self.proxies, &request.target).cloned() {
                 if has_chunked_transfer_encoding(&request) {
                     let Some(conn) = self.connections.get_mut(&fd) else {
                         return Ok(());
@@ -2188,7 +2188,7 @@ mod linux {
                     return Ok(());
                 }
 
-                self.start_proxy(fd, &request, proxy, keep_alive)?;
+                self.start_proxy(fd, &request, &proxy, keep_alive)?;
                 return Ok(());
             }
 
@@ -2370,6 +2370,14 @@ mod linux {
         fn upstream_read_ready(&mut self, client_fd: RawFd, upstream_fd: RawFd) -> io::Result<()> {
             let mut finished = false;
             let mut close_client = false;
+            let has_pending_write = self
+                .connections
+                .get(&client_fd)
+                .is_some_and(|conn| conn.has_pending_write());
+
+            if has_pending_write {
+                return Ok(());
+            }
 
             {
                 let Some(conn) = self.connections.get_mut(&client_fd) else {
@@ -2380,10 +2388,6 @@ mod linux {
                     self.cleanup_upstream_fd(upstream_fd);
                     return Ok(());
                 };
-
-                if conn.has_pending_write() {
-                    return Ok(());
-                }
 
                 let mut buf = [0_u8; 8192];
                 loop {
