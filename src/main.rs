@@ -772,12 +772,16 @@ fn serve_static(
     };
 
     let mut path = root.join(&request_path);
-    let file_path = match fs::metadata(&path) {
+    let (file_path, meta) = match fs::metadata(&path) {
         Ok(meta) if meta.is_dir() => {
             path = path.join("index.html");
             match fs::metadata(&path) {
-                Ok(meta) if meta.is_file() => path,
-                _ if spa_fallback => root.join("index.html"),
+                Ok(meta) if meta.is_file() => (path, meta),
+                _ if spa_fallback => {
+                    let path = root.join("index.html");
+                    let meta = fs::metadata(&path)?;
+                    (path, meta)
+                }
                 _ => {
                     return Ok(Response::new(build_response(
                         404,
@@ -790,8 +794,12 @@ fn serve_static(
                 }
             }
         }
-        Ok(meta) if meta.is_file() => path,
-        _ if spa_fallback => root.join("index.html"),
+        Ok(meta) if meta.is_file() => (path, meta),
+        _ if spa_fallback => {
+            let path = root.join("index.html");
+            let meta = fs::metadata(&path)?;
+            (path, meta)
+        }
         _ => {
             return Ok(Response::new(build_response(
                 404,
@@ -816,26 +824,30 @@ fn serve_static(
     }
 
     let content_type = content_type(&file_path);
+    let len = meta.len();
     if request.method == "HEAD" {
-        let len = fs::metadata(&file_path)
-            .map(|meta| meta.len() as usize)
-            .unwrap_or(0);
         return Ok(Response::new(build_head_response(
             200,
             "OK",
             content_type,
-            len,
+            len as usize,
             keep_alive,
             runtime,
         )));
     }
 
-    let file = fs::File::open(&file_path)?;
-    let len = fs::metadata(&file_path)
-        .map(|meta| meta.len() as usize)
-        .unwrap_or(0);
+    let mut file = fs::File::open(&file_path)?;
+    if len <= INLINE_FILE_THRESHOLD {
+        let mut body = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut body)?;
+        let mut bytes =
+            build_head_response(200, "OK", content_type, body.len(), keep_alive, runtime);
+        bytes.extend_from_slice(&body);
+        return Ok(Response::new(bytes));
+    }
+
     Ok(Response::streamed(
-        build_head_response(200, "OK", content_type, len, keep_alive, runtime),
+        build_head_response(200, "OK", content_type, len as usize, keep_alive, runtime),
         file,
     ))
 }
@@ -1264,6 +1276,7 @@ fn print_usage() {
 }
 
 const FILE_CHUNK_SIZE: usize = 64 * 1024;
+const INLINE_FILE_THRESHOLD: u64 = 16 * 1024;
 
 struct Response {
     head: Vec<u8>,
@@ -1383,7 +1396,6 @@ impl TempBodyFile {
         }
         Ok(())
     }
-
 }
 
 impl Read for TempBodyFile {
@@ -2175,6 +2187,8 @@ mod linux {
 
             if let Some(request) = parsed_request {
                 self.dispatch_request(fd, request)?;
+                self.write_ready(fd)?;
+                return Ok(());
             }
 
             self.refresh_interest(fd)?;
@@ -2721,7 +2735,7 @@ mod tests {
     }
 
     #[test]
-    fn static_get_uses_streamed_file_body() {
+    fn static_get_inlines_small_file_body() {
         let root = std::env::temp_dir().join(format!(
             "pear-test-{}-{}",
             std::process::id(),
@@ -2747,10 +2761,49 @@ mod tests {
             .expect("static response");
 
         assert!(response.head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.head.ends_with(b"\r\nhello world"));
+        match response.body {
+            ResponseBody::Empty => {}
+            ResponseBody::File(_) => panic!("expected inline small file body"),
+            ResponseBody::TempFile(_) => panic!("expected static file body, not temp body"),
+        }
+
+        let _ = fs::remove_file(file_path);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn static_get_streams_large_file_body() {
+        let root = std::env::temp_dir().join(format!(
+            "pear-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("temp root should be created");
+        let file_path = root.join("index.html");
+        fs::write(&file_path, vec![b'a'; INLINE_FILE_THRESHOLD as usize + 1])
+            .expect("temp file should be written");
+        let canonical_root = fs::canonicalize(&root).expect("root should canonicalize");
+
+        let request = Request {
+            method: "GET".to_string(),
+            target: "/".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+
+        let response = serve_static(&request, &canonical_root, true, &runtime(), true)
+            .expect("static response");
+
+        assert!(response.head.starts_with(b"HTTP/1.1 200 OK\r\n"));
         match response.body {
             ResponseBody::File(_) => {}
             ResponseBody::TempFile(_) => panic!("expected static file body, not temp body"),
-            ResponseBody::Empty => panic!("expected streamed file body"),
+            ResponseBody::Empty => panic!("expected streamed large file body"),
         }
 
         let _ = fs::remove_file(file_path);
