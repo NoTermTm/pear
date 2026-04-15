@@ -236,11 +236,20 @@ jobs:
 
           text.sub!(/version\s+"[^"]+"/, %(version "#{version}"))
 
+          macos_block = [
+            "  on_macos do",
+            "    if Hardware::CPU.arm?",
+            "      url \"#{arm_url}\"",
+            "      sha256 \"#{arm_sha}\"",
+            "    else",
+            "      url \"#{intel_url}\"",
+            "      sha256 \"#{intel_sha}\"",
+            "    end",
+            "  end",
+          ].join("\n")
+
           if text.include?('Hardware::CPU.arm?')
-            text.sub!(/url\s+"[^"]*pear-macos-aarch64\.tar\.gz"/, %(url "#{arm_url}"))
-            text.sub!(/sha256\s+"[0-9a-f]{64}"/, %(sha256 "#{arm_sha}"))
-            text.sub!(/url\s+"[^"]*pear-macos-x86_64\.tar\.gz"/, %(url "#{intel_url}"))
-            text.sub!(/sha256\s+"[0-9a-f]{64}"/, %(sha256 "#{intel_sha}"))
+            text.sub!(/  on_macos do\n.*?\n  end/m, macos_block)
           else
             raise "Unsupported formula structure in #{formula_path}"
           end
