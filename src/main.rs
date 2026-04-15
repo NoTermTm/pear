@@ -844,8 +844,19 @@ fn serve_static(
                 Ok(meta) if meta.is_file() => (path, meta),
                 _ if spa_fallback => {
                     let path = root.join("index.html");
-                    let meta = fs::metadata(&path)?;
-                    (path, meta)
+                    match fs::metadata(&path) {
+                        Ok(meta) if meta.is_file() => (path, meta),
+                        _ => {
+                            return Ok(Response::new(build_response(
+                                404,
+                                "Not Found",
+                                "text/plain",
+                                b"Not Found",
+                                keep_alive,
+                                runtime,
+                            )));
+                        }
+                    }
                 }
                 _ => {
                     return Ok(Response::new(build_response(
@@ -862,8 +873,19 @@ fn serve_static(
         Ok(meta) if meta.is_file() => (path, meta),
         _ if spa_fallback => {
             let path = root.join("index.html");
-            let meta = fs::metadata(&path)?;
-            (path, meta)
+            match fs::metadata(&path) {
+                Ok(meta) if meta.is_file() => (path, meta),
+                _ => {
+                    return Ok(Response::new(build_response(
+                        404,
+                        "Not Found",
+                        "text/plain",
+                        b"Not Found",
+                        keep_alive,
+                        runtime,
+                    )));
+                }
+            }
         }
         _ => {
             return Ok(Response::new(build_response(
@@ -1090,7 +1112,9 @@ fn proxy_request_with_root_store(
         received.extend_from_slice(&buf[..read]);
     };
 
-    let head = rewrite_proxy_response_head(&received[..header_end], runtime, keep_alive)?;
+    let upstream_head = &received[..header_end];
+    let content_length = upstream_content_length(upstream_head);
+    let head = rewrite_proxy_response_head(upstream_head, runtime, keep_alive)?;
     let body_start = header_end + 4;
     if body_start >= received.len() {
         return Ok(Response::new(head));
@@ -1098,7 +1122,7 @@ fn proxy_request_with_root_store(
 
     let mut temp = TempBodyFile::new()?;
     temp.write_all(&received[body_start..])?;
-    io::copy(&mut upstream, &mut temp)?;
+    copy_upstream_body(&mut upstream, &mut temp, received.len() - body_start, content_length)?;
     temp.rewind()?;
     Ok(Response::with_temp_body(head, temp))
 }
@@ -1133,15 +1157,78 @@ fn proxy_request_streaming<W: Write>(
         received.extend_from_slice(&buf[..read]);
     };
 
-    let head = rewrite_proxy_response_head(&received[..header_end], runtime, keep_alive)?;
+    let upstream_head = &received[..header_end];
+    let content_length = upstream_content_length(upstream_head);
+    let head = rewrite_proxy_response_head(upstream_head, runtime, keep_alive)?;
     writer.write_all(&head)?;
 
     let body_start = header_end + 4;
+    let mut copied = 0;
     if body_start < received.len() {
         writer.write_all(&received[body_start..])?;
+        copied = received.len() - body_start;
     }
-    io::copy(&mut upstream, writer)?;
+    copy_upstream_body(&mut upstream, writer, copied, content_length)?;
     Ok(())
+}
+
+fn upstream_content_length(header_bytes: &[u8]) -> Option<usize> {
+    let header_text = std::str::from_utf8(header_bytes).ok()?;
+    for line in header_text.split("\r\n").skip(1) {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+fn copy_upstream_body<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    mut copied: usize,
+    content_length: Option<usize>,
+) -> io::Result<()> {
+    let mut buf = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(read) => {
+                writer.write_all(&buf[..read])?;
+                copied += read;
+                if content_length.is_some_and(|expected| copied >= expected) {
+                    return Ok(());
+                }
+            }
+            Err(err) if should_treat_upstream_eof_as_clean_close(&err, copied, content_length) => {
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn should_treat_upstream_eof_as_clean_close(
+    err: &io::Error,
+    copied: usize,
+    content_length: Option<usize>,
+) -> bool {
+    if !is_tls_close_notify_eof(err) {
+        return false;
+    }
+
+    match content_length {
+        Some(expected) => copied >= expected,
+        None => copied > 0,
+    }
+}
+
+fn is_tls_close_notify_eof(err: &io::Error) -> bool {
+    err.kind() == ErrorKind::UnexpectedEof
+        && err
+            .to_string()
+            .contains("peer closed connection without sending TLS close_notify")
 }
 
 fn rewrite_proxy_response_head(
@@ -2665,6 +2752,53 @@ mod tests {
             proxied_target("/api/users?id=1", &proxy),
             "/backend/users?id=1"
         );
+    }
+
+    #[test]
+    fn missing_spa_fallback_index_returns_404_instead_of_io_error() {
+        let root = std::env::temp_dir().join(format!(
+            "pear-test-missing-index-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("temp root should be created");
+        let canonical_root = fs::canonicalize(&root).expect("root should canonicalize");
+        let request = Request {
+            method: "GET".to_string(),
+            target: "/missing".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+
+        let response =
+            serve_static(&request, &canonical_root, true, &runtime(), true).expect("response");
+        let text = String::from_utf8(response.head).expect("response should be utf8");
+        assert!(text.starts_with("HTTP/1.1 404 Not Found\r\n"));
+
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn tls_close_notify_eof_is_treated_as_clean_after_complete_body() {
+        let err = io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        );
+        assert!(should_treat_upstream_eof_as_clean_close(
+            &err,
+            5,
+            Some(5)
+        ));
+        assert!(!should_treat_upstream_eof_as_clean_close(
+            &err,
+            4,
+            Some(5)
+        ));
+        assert!(should_treat_upstream_eof_as_clean_close(&err, 1, None));
     }
 
     #[test]
