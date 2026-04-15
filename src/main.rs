@@ -10,6 +10,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rustls::{
+    ClientConfig, ClientConnection, RootCertStore, StreamOwned,
+    pki_types::{ServerName, UnixTime},
+};
+
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_CONFIG: &str = "config.toml";
@@ -51,9 +56,16 @@ struct ProxyRule {
 
 #[derive(Clone, Debug)]
 struct Upstream {
+    scheme: UpstreamScheme,
     host: String,
     port: u16,
     base_path: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpstreamScheme {
+    Http,
+    Https,
 }
 
 #[derive(Debug)]
@@ -589,7 +601,7 @@ impl ProxyRule {
 
     fn parse(value: &str) -> Result<Self, String> {
         let (prefix, target) = value.split_once('=').ok_or_else(|| {
-            format!("Invalid proxy rule '{value}', expected /path=http://host:port")
+            format!("Invalid proxy rule '{value}', expected /path=http[s]://host:port")
         })?;
 
         Self::new(prefix, target)
@@ -605,29 +617,82 @@ impl ProxyRule {
 
 impl Upstream {
     fn parse(value: &str) -> Result<Self, String> {
-        let rest = value
-            .strip_prefix("http://")
-            .ok_or_else(|| format!("Only http:// proxy targets are supported: {value}"))?;
+        let (scheme, default_port, rest) = if let Some(rest) = value.strip_prefix("http://") {
+            (UpstreamScheme::Http, 80, rest)
+        } else if let Some(rest) = value.strip_prefix("https://") {
+            (UpstreamScheme::Https, 443, rest)
+        } else {
+            return Err(format!(
+                "Proxy target must start with http:// or https://: {value}"
+            ));
+        };
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         if authority.is_empty() {
             return Err(format!("Missing proxy upstream host: {value}"));
         }
 
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) if !host.is_empty() => {
-                let port = port
-                    .parse()
-                    .map_err(|_| format!("Invalid proxy upstream port: {port}"))?;
-                (host.to_string(), port)
-            }
-            _ => (authority.to_string(), 80),
-        };
+        let (host, port) = parse_upstream_authority(authority, default_port)?;
 
         Ok(Self {
+            scheme,
             host,
             port,
             base_path: normalize_base_path(path),
         })
+    }
+
+    fn scheme_name(&self) -> &'static str {
+        match self.scheme {
+            UpstreamScheme::Http => "http",
+            UpstreamScheme::Https => "https",
+        }
+    }
+
+    fn authority_header(&self) -> String {
+        let default_port = match self.scheme {
+            UpstreamScheme::Http => 80,
+            UpstreamScheme::Https => 443,
+        };
+        if self.port == default_port {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+fn parse_upstream_authority(authority: &str, default_port: u16) -> Result<(String, u16), String> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("Invalid IPv6 proxy upstream authority: {authority}"))?;
+        if host.is_empty() {
+            return Err(format!("Missing proxy upstream host: {authority}"));
+        }
+        if port.is_empty() {
+            return Ok((host.to_string(), default_port));
+        }
+        let port = port
+            .strip_prefix(':')
+            .ok_or_else(|| format!("Invalid IPv6 proxy upstream authority: {authority}"))?
+            .parse()
+            .map_err(|_| format!("Invalid proxy upstream port in authority: {authority}"))?;
+        return Ok((host.to_string(), port));
+    }
+
+    let colon_count = authority.bytes().filter(|byte| *byte == b':').count();
+    if colon_count > 1 {
+        return Ok((authority.to_string(), default_port));
+    }
+
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => {
+            let port = port
+                .parse()
+                .map_err(|_| format!("Invalid proxy upstream port: {port}"))?;
+            Ok((host.to_string(), port))
+        }
+        _ => Ok((authority.to_string(), default_port)),
     }
 }
 
@@ -860,33 +925,111 @@ fn find_proxy<'a>(proxies: &'a [ProxyRule], target: &str) -> Option<&'a ProxyRul
         .max_by_key(|proxy| proxy.prefix.len())
 }
 
-fn proxy_request(
+enum UpstreamStream {
+    Plain(TcpStream),
+    Tls(StreamOwned<ClientConnection, TcpStream>),
+}
+
+impl Read for UpstreamStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for UpstreamStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+impl UpstreamStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.set_read_timeout(timeout),
+            Self::Tls(stream) => stream.sock.set_read_timeout(timeout),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.set_write_timeout(timeout),
+            Self::Tls(stream) => stream.sock.set_write_timeout(timeout),
+        }
+    }
+
+    fn shutdown_write(&self) -> io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.shutdown(Shutdown::Write),
+            Self::Tls(stream) => stream.sock.shutdown(Shutdown::Write),
+        }
+    }
+}
+
+fn connect_upstream(proxy: &ProxyRule) -> io::Result<UpstreamStream> {
+    connect_upstream_with_root_store(proxy, default_root_store())
+}
+
+fn connect_upstream_with_root_store(
+    proxy: &ProxyRule,
+    root_store: RootCertStore,
+) -> io::Result<UpstreamStream> {
+    let tcp = TcpStream::connect((proxy.upstream.host.as_str(), proxy.upstream.port))?;
+    match proxy.upstream.scheme {
+        UpstreamScheme::Http => Ok(UpstreamStream::Plain(tcp)),
+        UpstreamScheme::Https => {
+            let config = ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let server_name = ServerName::try_from(proxy.upstream.host.clone())
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid upstream host"))?;
+            let connection = ClientConnection::new(std::sync::Arc::new(config), server_name)
+                .map_err(|err| io::Error::other(format!("TLS setup failed: {err}")))?;
+            Ok(UpstreamStream::Tls(StreamOwned::new(connection, tcp)))
+        }
+    }
+}
+
+fn default_root_store() -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+fn write_proxy_request(
+    upstream: &mut UpstreamStream,
     request: &Request,
     proxy: &ProxyRule,
-    runtime: &RuntimeConfig,
-    keep_alive: bool,
-) -> io::Result<Response> {
-    let mut upstream = TcpStream::connect((proxy.upstream.host.as_str(), proxy.upstream.port))?;
-    upstream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    upstream.set_write_timeout(Some(Duration::from_secs(30)))?;
-
+) -> io::Result<()> {
     let target = proxied_target(&request.target, proxy);
     write!(
         upstream,
         "{} {} {}\r\n",
         request.method, target, request.version
     )?;
-    write!(
-        upstream,
-        "Host: {}:{}\r\n",
-        proxy.upstream.host, proxy.upstream.port
-    )?;
+    write!(upstream, "Host: {}\r\n", proxy.upstream.authority_header())?;
     write!(
         upstream,
         "X-Forwarded-Host: {}\r\n",
         header_value(request, "host").unwrap_or("")
     )?;
-    write!(upstream, "X-Forwarded-Proto: http\r\n")?;
+    write!(
+        upstream,
+        "X-Forwarded-Proto: {}\r\n",
+        forwarded_proto(request)
+    )?;
 
     for (name, value) in &request.headers {
         if name.eq_ignore_ascii_case("host")
@@ -901,7 +1044,34 @@ fn proxy_request(
     write!(upstream, "Connection: close\r\n\r\n")?;
     upstream.write_all(&request.body)?;
     upstream.flush()?;
-    upstream.shutdown(Shutdown::Write)?;
+    let _ = upstream.shutdown_write();
+    Ok(())
+}
+
+fn forwarded_proto(request: &Request) -> &str {
+    header_value(request, "x-forwarded-proto").unwrap_or("http")
+}
+
+fn proxy_request(
+    request: &Request,
+    proxy: &ProxyRule,
+    runtime: &RuntimeConfig,
+    keep_alive: bool,
+) -> io::Result<Response> {
+    proxy_request_with_root_store(request, proxy, runtime, keep_alive, default_root_store())
+}
+
+fn proxy_request_with_root_store(
+    request: &Request,
+    proxy: &ProxyRule,
+    runtime: &RuntimeConfig,
+    keep_alive: bool,
+    root_store: RootCertStore,
+) -> io::Result<Response> {
+    let mut upstream = connect_upstream_with_root_store(proxy, root_store)?;
+    upstream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    upstream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    write_proxy_request(&mut upstream, request, proxy)?;
 
     let mut received = Vec::with_capacity(8192);
     let mut buf = [0_u8; 8192];
@@ -941,42 +1111,10 @@ fn proxy_request_streaming<W: Write>(
     keep_alive: bool,
     writer: &mut W,
 ) -> io::Result<()> {
-    let mut upstream = TcpStream::connect((proxy.upstream.host.as_str(), proxy.upstream.port))?;
+    let mut upstream = connect_upstream(proxy)?;
     upstream.set_read_timeout(Some(Duration::from_secs(30)))?;
     upstream.set_write_timeout(Some(Duration::from_secs(30)))?;
-
-    let target = proxied_target(&request.target, proxy);
-    write!(
-        upstream,
-        "{} {} {}\r\n",
-        request.method, target, request.version
-    )?;
-    write!(
-        upstream,
-        "Host: {}:{}\r\n",
-        proxy.upstream.host, proxy.upstream.port
-    )?;
-    write!(
-        upstream,
-        "X-Forwarded-Host: {}\r\n",
-        header_value(request, "host").unwrap_or("")
-    )?;
-    write!(upstream, "X-Forwarded-Proto: http\r\n")?;
-
-    for (name, value) in &request.headers {
-        if name.eq_ignore_ascii_case("host")
-            || name.eq_ignore_ascii_case("connection")
-            || name.eq_ignore_ascii_case("proxy-connection")
-        {
-            continue;
-        }
-        write!(upstream, "{name}: {value}\r\n")?;
-    }
-
-    write!(upstream, "Connection: close\r\n\r\n")?;
-    upstream.write_all(&request.body)?;
-    upstream.flush()?;
-    upstream.shutdown(Shutdown::Write)?;
+    write_proxy_request(&mut upstream, request, proxy)?;
 
     let mut received = Vec::with_capacity(8192);
     let mut buf = [0_u8; 8192];
@@ -1264,13 +1402,14 @@ fn print_usage() {
                --max-request-size <BYTES>\n\
                                 Max request size, default 1048576\n\
                --no-spa         Disable fallback to index.html\n\
-               --proxy <RULE>   Reverse proxy rule, e.g. /api=http://127.0.0.1:3000\n\
+               --proxy <RULE>   Reverse proxy rule, e.g. /api=https://api.example.com\n\
            -h, --help           Show this help\n\n\
          Examples:\n\
            pear\n\
            pear -p 3000\n\
            pear --config config.toml\n\
            pear --proxy /api=http://127.0.0.1:3000 ./dist\n\
+           pear --proxy /api=https://api.example.com ./dist\n\
            pear --host 0.0.0.0 --port 8080 ./dist"
     );
 }
@@ -1454,8 +1593,12 @@ mod compat {
         println!("Open http://{addr}");
         for proxy in &config.proxies {
             println!(
-                "Proxy {} -> http://{}:{}{}",
-                proxy.prefix, proxy.upstream.host, proxy.upstream.port, proxy.upstream.base_path
+                "Proxy {} -> {}://{}:{}{}",
+                proxy.prefix,
+                proxy.upstream.scheme_name(),
+                proxy.upstream.host,
+                proxy.upstream.port,
+                proxy.upstream.base_path
             );
         }
         println!("Runtime compat + keep-alive");
@@ -1715,8 +1858,12 @@ mod linux {
         println!("Open http://{addr}");
         for proxy in &config.proxies {
             println!(
-                "Proxy {} -> http://{}:{}{}",
-                proxy.prefix, proxy.upstream.host, proxy.upstream.port, proxy.upstream.base_path
+                "Proxy {} -> {}://{}:{}{}",
+                proxy.prefix,
+                proxy.upstream.scheme_name(),
+                proxy.upstream.host,
+                proxy.upstream.port,
+                proxy.upstream.base_path
             );
         }
         println!("Runtime epoll + keep-alive");
@@ -1746,19 +1893,10 @@ mod linux {
         write_head: Vec<u8>,
         head_written: usize,
         write_body: PendingBody,
-        proxy: Option<ProxyState>,
         last_active: Instant,
         requests_served: usize,
         close_after_write: bool,
         peer_closed: bool,
-    }
-
-    struct ProxyState {
-        upstream: TcpStream,
-        upstream_fd: RawFd,
-        header_buf: Vec<u8>,
-        headers_sent: bool,
-        upstream_done: bool,
     }
 
     enum PendingBody {
@@ -1789,7 +1927,6 @@ mod linux {
                 write_head: Vec::new(),
                 head_written: 0,
                 write_body: PendingBody::Empty,
-                proxy: None,
                 last_active: Instant::now(),
                 requests_served: 0,
                 close_after_write: false,
@@ -1803,10 +1940,6 @@ mod linux {
 
         fn has_pending_write(&self) -> bool {
             self.head_written < self.write_head.len() || self.write_body.has_pending_data()
-        }
-
-        fn is_proxying(&self) -> bool {
-            self.proxy.is_some()
         }
     }
 
@@ -1998,7 +2131,6 @@ mod linux {
         proxies: Vec<ProxyRule>,
         runtime: RuntimeConfig,
         connections: HashMap<RawFd, Connection>,
-        upstream_to_client: HashMap<RawFd, RawFd>,
     }
 
     impl Server {
@@ -2022,7 +2154,6 @@ mod linux {
                 proxies,
                 runtime,
                 connections: HashMap::new(),
-                upstream_to_client: HashMap::new(),
             })
         }
 
@@ -2035,18 +2166,6 @@ mod linux {
                     let fd = event.data as RawFd;
                     if fd == self.listener_fd {
                         self.accept_ready()?;
-                        continue;
-                    }
-
-                    if let Some(&client_fd) = self.upstream_to_client.get(&fd) {
-                        if event.events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP) != 0 {
-                            self.finish_proxy_upstream(client_fd, true)?;
-                            continue;
-                        }
-
-                        if event.events & EPOLLIN != 0 {
-                            self.upstream_read_ready(client_fd, fd)?;
-                        }
                         continue;
                     }
 
@@ -2102,15 +2221,6 @@ mod linux {
         fn read_ready(&mut self, fd: RawFd) -> io::Result<()> {
             let mut parsed_request = None;
             let mut close_now = false;
-            let proxying = self
-                .connections
-                .get(&fd)
-                .is_some_and(|conn| conn.is_proxying());
-
-            if proxying {
-                self.refresh_interest(fd)?;
-                return Ok(());
-            }
 
             {
                 let Some(conn) = self.connections.get_mut(&fd) else {
@@ -2203,32 +2313,6 @@ mod linux {
                 wants_keep_alive(&request) && conn.requests_served + 1 < self.runtime.keep_alive_max
             };
 
-            if let Some(proxy) = find_proxy(&self.proxies, &request.target).cloned() {
-                if has_chunked_transfer_encoding(&request) {
-                    let Some(conn) = self.connections.get_mut(&fd) else {
-                        return Ok(());
-                    };
-                    conn.requests_served += 1;
-                    conn.last_active = Instant::now();
-                    conn.write_head = build_response(
-                        501,
-                        "Not Implemented",
-                        "text/plain",
-                        b"Chunked transfer encoding is not supported",
-                        false,
-                        &self.runtime,
-                    );
-                    conn.head_written = 0;
-                    conn.write_body = PendingBody::empty();
-                    conn.close_after_write = true;
-                    self.refresh_interest(fd)?;
-                    return Ok(());
-                }
-
-                self.start_proxy(fd, &request, &proxy, keep_alive)?;
-                return Ok(());
-            }
-
             let response = handle_request(
                 &request,
                 &self.root,
@@ -2286,9 +2370,9 @@ mod linux {
                     conn.head_written = 0;
                     conn.write_body = PendingBody::empty();
                     conn.last_active = Instant::now();
-                    if (conn.close_after_write || conn.peer_closed) && !conn.is_proxying() {
+                    if conn.close_after_write || conn.peer_closed {
                         close_now = true;
-                    } else if !conn.is_proxying() && !conn.read_buf.is_empty() {
+                    } else if !conn.read_buf.is_empty() {
                         parse_next = true;
                     }
                 }
@@ -2338,206 +2422,12 @@ mod linux {
             Ok(())
         }
 
-        fn start_proxy(
-            &mut self,
-            client_fd: RawFd,
-            request: &Request,
-            proxy: &ProxyRule,
-            keep_alive: bool,
-        ) -> io::Result<()> {
-            let mut upstream =
-                TcpStream::connect((proxy.upstream.host.as_str(), proxy.upstream.port))?;
-            upstream.set_nonblocking(true)?;
-            upstream.set_read_timeout(None)?;
-            upstream.set_write_timeout(None)?;
-
-            let target = proxied_target(&request.target, proxy);
-            write!(
-                upstream,
-                "{} {} {}\r\n",
-                request.method, target, request.version
-            )?;
-            write!(
-                upstream,
-                "Host: {}:{}\r\n",
-                proxy.upstream.host, proxy.upstream.port
-            )?;
-            write!(
-                upstream,
-                "X-Forwarded-Host: {}\r\n",
-                header_value(request, "host").unwrap_or("")
-            )?;
-            write!(upstream, "X-Forwarded-Proto: http\r\n")?;
-
-            for (name, value) in &request.headers {
-                if name.eq_ignore_ascii_case("host")
-                    || name.eq_ignore_ascii_case("connection")
-                    || name.eq_ignore_ascii_case("proxy-connection")
-                {
-                    continue;
-                }
-                write!(upstream, "{name}: {value}\r\n")?;
-            }
-
-            write!(upstream, "Connection: close\r\n\r\n")?;
-            upstream.write_all(&request.body)?;
-            upstream.flush()?;
-            upstream.shutdown(Shutdown::Write)?;
-
-            let upstream_fd = upstream.as_raw_fd();
-            self.epoll.add(upstream_fd, EPOLLIN | EPOLLRDHUP)?;
-            self.upstream_to_client.insert(upstream_fd, client_fd);
-
-            let Some(conn) = self.connections.get_mut(&client_fd) else {
-                return Ok(());
-            };
-            conn.requests_served += 1;
-            conn.last_active = Instant::now();
-            conn.close_after_write = !keep_alive;
-            conn.proxy = Some(ProxyState {
-                upstream,
-                upstream_fd,
-                header_buf: Vec::with_capacity(8192),
-                headers_sent: false,
-                upstream_done: false,
-            });
-            self.refresh_interest(client_fd)
-        }
-
-        fn upstream_read_ready(&mut self, client_fd: RawFd, upstream_fd: RawFd) -> io::Result<()> {
-            let mut finished = false;
-            let mut close_client = false;
-            let has_pending_write = self
-                .connections
-                .get(&client_fd)
-                .is_some_and(|conn| conn.has_pending_write());
-
-            if has_pending_write {
-                return Ok(());
-            }
-
-            {
-                let Some(conn) = self.connections.get_mut(&client_fd) else {
-                    self.cleanup_upstream_fd(upstream_fd);
-                    return Ok(());
-                };
-                let Some(proxy) = conn.proxy.as_mut() else {
-                    self.cleanup_upstream_fd(upstream_fd);
-                    return Ok(());
-                };
-
-                let mut buf = [0_u8; 8192];
-                loop {
-                    match proxy.upstream.read(&mut buf) {
-                        Ok(0) => {
-                            proxy.upstream_done = true;
-                            finished = true;
-                            break;
-                        }
-                        Ok(read) => {
-                            conn.last_active = Instant::now();
-                            if !proxy.headers_sent {
-                                proxy.header_buf.extend_from_slice(&buf[..read]);
-                                if let Some(header_end) = find_header_end(&proxy.header_buf) {
-                                    conn.write_head = rewrite_proxy_response_head(
-                                        &proxy.header_buf[..header_end],
-                                        &self.runtime,
-                                        !conn.close_after_write,
-                                    )?;
-                                    conn.head_written = 0;
-                                    let body_start = header_end + 4;
-                                    if body_start < proxy.header_buf.len() {
-                                        conn.write_head
-                                            .extend_from_slice(&proxy.header_buf[body_start..]);
-                                    }
-                                    proxy.header_buf.clear();
-                                    proxy.headers_sent = true;
-                                    break;
-                                }
-
-                                if proxy.header_buf.len() > self.runtime.max_request_size {
-                                    conn.write_head = build_response(
-                                        502,
-                                        "Bad Gateway",
-                                        "text/plain",
-                                        b"Bad Gateway",
-                                        false,
-                                        &self.runtime,
-                                    );
-                                    conn.head_written = 0;
-                                    conn.close_after_write = true;
-                                    close_client = true;
-                                    finished = true;
-                                    break;
-                                }
-                            } else {
-                                conn.write_head = buf[..read].to_vec();
-                                conn.head_written = 0;
-                                break;
-                            }
-                        }
-                        Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                        Err(err) => {
-                            eprintln!("Proxy upstream read failed: {err}");
-                            conn.write_head = build_response(
-                                502,
-                                "Bad Gateway",
-                                "text/plain",
-                                b"Bad Gateway",
-                                false,
-                                &self.runtime,
-                            );
-                            conn.head_written = 0;
-                            conn.close_after_write = true;
-                            close_client = true;
-                            finished = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if finished {
-                self.finish_proxy_upstream(client_fd, close_client)?;
-            }
-            self.refresh_interest(client_fd)?;
-            Ok(())
-        }
-
-        fn finish_proxy_upstream(&mut self, client_fd: RawFd, force_close: bool) -> io::Result<()> {
-            let upstream_fd = self
-                .connections
-                .get(&client_fd)
-                .and_then(|conn| conn.proxy.as_ref().map(|proxy| proxy.upstream_fd));
-
-            if let Some(upstream_fd) = upstream_fd {
-                self.cleanup_upstream_fd(upstream_fd);
-            }
-
-            if let Some(conn) = self.connections.get_mut(&client_fd) {
-                conn.proxy = None;
-                if force_close {
-                    conn.close_after_write = true;
-                }
-            }
-
-            self.refresh_interest(client_fd)
-        }
-
-        fn cleanup_upstream_fd(&mut self, upstream_fd: RawFd) {
-            let _ = self.epoll.delete(upstream_fd);
-            self.upstream_to_client.remove(&upstream_fd);
-        }
-
         fn refresh_interest(&mut self, fd: RawFd) -> io::Result<()> {
             let Some(conn) = self.connections.get(&fd) else {
                 return Ok(());
             };
 
-            let mut events = EPOLLRDHUP;
-            if !conn.is_proxying() {
-                events |= EPOLLIN;
-            }
+            let mut events = EPOLLIN | EPOLLRDHUP;
             if conn.has_pending_write() {
                 events |= EPOLLOUT;
             }
@@ -2572,13 +2462,6 @@ mod linux {
         }
 
         fn close_connection(&mut self, fd: RawFd) {
-            if let Some(upstream_fd) = self
-                .connections
-                .get(&fd)
-                .and_then(|conn| conn.proxy.as_ref().map(|proxy| proxy.upstream_fd))
-            {
-                self.cleanup_upstream_fd(upstream_fd);
-            }
             let _ = self.epoll.delete(fd);
             self.connections.remove(&fd);
         }
@@ -2603,6 +2486,12 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::generate_simple_self_signed;
+    use rustls::{
+        ServerConfig, ServerConnection,
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    };
+    use std::{net::TcpListener, sync::mpsc, thread};
 
     fn runtime() -> RuntimeConfig {
         RuntimeConfig {
@@ -2626,6 +2515,81 @@ mod tests {
             headers,
             body: Vec::new(),
         }
+    }
+
+    fn read_response_body(mut response: Response) -> Vec<u8> {
+        let mut body = Vec::new();
+        match &mut response.body {
+            ResponseBody::Empty => {}
+            ResponseBody::File(file) => {
+                file.read_to_end(&mut body).expect("file body should read");
+            }
+            ResponseBody::TempFile(file) => {
+                file.read_to_end(&mut body).expect("temp body should read");
+            }
+        }
+        body
+    }
+
+    fn spawn_https_upstream() -> (u16, RootCertStore, thread::JoinHandle<()>) {
+        let certified =
+            generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .expect("certificate should generate");
+        let cert_der: CertificateDer<'static> = certified.cert.der().clone();
+        let key_der: PrivateKeyDer<'static> =
+            PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()).into();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server config should build");
+
+        let mut root_store = RootCertStore::empty();
+        root_store
+            .add(cert_der.clone())
+            .expect("test cert should be trusted");
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener addr should exist")
+            .port();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            ready_tx.send(()).expect("ready signal should send");
+            let (stream, _) = listener.accept().expect("upstream should accept");
+            let connection =
+                ServerConnection::new(std::sync::Arc::new(server_config)).expect("tls server");
+            let mut tls = StreamOwned::new(connection, stream);
+
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = tls.read(&mut buf).expect("request should read");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if find_header_end(&request).is_some() {
+                    break;
+                }
+            }
+
+            let request_text = String::from_utf8(request).expect("request should be utf8");
+            assert!(request_text.starts_with("GET /secure HTTP/1.1\r\n"));
+            assert!(request_text.contains(&format!("Host: localhost:{port}\r\n")));
+            assert!(request_text.contains("X-Forwarded-Proto: https\r\n"));
+
+            tls.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            )
+            .expect("response should write");
+            tls.flush().expect("response should flush");
+            tls.conn.send_close_notify();
+            tls.flush().expect("close notify should flush");
+        });
+        ready_rx.recv().expect("ready signal should arrive");
+
+        (port, root_store, handle)
     }
 
     #[test]
@@ -2701,6 +2665,46 @@ mod tests {
             proxied_target("/api/users?id=1", &proxy),
             "/backend/users?id=1"
         );
+    }
+
+    #[test]
+    fn parses_https_upstream_and_omits_default_port_in_host_header() {
+        let proxy =
+            ProxyRule::new("/secure", "https://localhost/base").expect("https proxy should parse");
+
+        assert_eq!(proxy.upstream.scheme, UpstreamScheme::Https);
+        assert_eq!(proxy.upstream.host, "localhost");
+        assert_eq!(proxy.upstream.port, 443);
+        assert_eq!(proxy.upstream.base_path, "/base");
+        assert_eq!(proxy.upstream.authority_header(), "localhost");
+    }
+
+    #[test]
+    fn proxy_request_supports_https_upstream() {
+        let (port, root_store, handle) = spawn_https_upstream();
+        let proxy = ProxyRule::new("/api", &format!("https://localhost:{port}/secure"))
+            .expect("https proxy should parse");
+        let request = Request {
+            method: "GET".to_string(),
+            target: "/api".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![
+                ("Host".to_string(), "pear.local".to_string()),
+                ("X-Forwarded-Proto".to_string(), "https".to_string()),
+            ],
+            body: Vec::new(),
+        };
+
+        let response =
+            proxy_request_with_root_store(&request, &proxy, &runtime(), true, root_store)
+                .expect("https proxy request should succeed");
+        let text = String::from_utf8(response.head.clone()).expect("head should be utf8");
+        let body = read_response_body(response);
+
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Connection: keep-alive\r\n"));
+        assert_eq!(body, b"hello");
+        handle.join().expect("https upstream thread should finish");
     }
 
     #[test]

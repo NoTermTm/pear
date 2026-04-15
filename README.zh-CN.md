@@ -122,6 +122,12 @@ http://127.0.0.1:8080/api/users
 http://127.0.0.1:3000/api/users
 ```
 
+也可以代理 HTTPS 上游：
+
+```sh
+pear --port 8080 --proxy /api=https://api.example.com ./dist
+```
+
 ### 代理多个前缀
 
 ```sh
@@ -169,6 +175,10 @@ target = "http://127.0.0.1:3000"
 [[proxy]]
 prefix = "/upload"
 target = "http://127.0.0.1:4000"
+
+[[proxy]]
+prefix = "/secure-api"
+target = "https://api.example.com"
 ```
 
 代理配置也支持简写：
@@ -177,6 +187,7 @@ target = "http://127.0.0.1:4000"
 [proxy]
 "/api" = "http://127.0.0.1:3000"
 "/upload" = "http://127.0.0.1:4000"
+"/secure-api" = "https://api.example.com"
 ```
 
 ### 配置字段说明
@@ -204,7 +215,7 @@ target = "http://127.0.0.1:4000"
     --max-connections <N>        最大客户端连接数，默认自动推导
     --max-request-size <BYTES>   最大请求大小，默认 1048576
     --no-spa                     关闭 index.html 回退
-    --proxy <RULE>               反向代理规则，例如 /api=http://127.0.0.1:3000
+    --proxy <RULE>               反向代理规则，例如 /api=https://api.example.com
 -h, --help                       显示帮助
 ```
 
@@ -275,9 +286,8 @@ CLI 中多个 `--proxy` 会追加到配置文件已有的代理规则后面。
 
 当前限制包括：
 
-- 代理上游只支持 `http://`
 - 不支持 request 侧的 chunked transfer encoding
-- Linux `epoll` 路径下的代理流式转发仍在重构中，当前工作区里还没有在 Linux 目标上完成验证
+- 代理响应目前走缓冲转发路径，不走事件循环内的流式转发
 - 不支持 TLS 终止
 - 不支持 HTTP/2 和更完整的缓存协商
 
@@ -298,6 +308,8 @@ cargo test
 - 请求解析
 - keep-alive 判定逻辑
 - 代理响应头重写
+- HTTP / HTTPS 上游解析
+- 通过本地 TLS 服务验证 HTTPS 上游代理
 - 路径清洗
 - 运行时配置校验
 - 流式静态响应形态

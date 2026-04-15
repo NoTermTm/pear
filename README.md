@@ -124,6 +124,12 @@ is forwarded to:
 http://127.0.0.1:3000/api/users
 ```
 
+You can also proxy HTTPS upstreams:
+
+```sh
+pear --port 8080 --proxy /api=https://api.example.com ./dist
+```
+
 ### Proxy Multiple Prefixes
 
 ```sh
@@ -171,6 +177,10 @@ target = "http://127.0.0.1:3000"
 [[proxy]]
 prefix = "/upload"
 target = "http://127.0.0.1:4000"
+
+[[proxy]]
+prefix = "/secure-api"
+target = "https://api.example.com"
 ```
 
 The proxy section also supports a compact map style:
@@ -179,6 +189,7 @@ The proxy section also supports a compact map style:
 [proxy]
 "/api" = "http://127.0.0.1:3000"
 "/upload" = "http://127.0.0.1:4000"
+"/secure-api" = "https://api.example.com"
 ```
 
 ### Config Fields
@@ -206,7 +217,7 @@ The proxy section also supports a compact map style:
     --max-connections <N>        Max open client connections, default auto-detected
     --max-request-size <BYTES>   Max request size, default 1048576
     --no-spa                     Disable fallback to index.html
-    --proxy <RULE>               Reverse proxy rule, e.g. /api=http://127.0.0.1:3000
+    --proxy <RULE>               Reverse proxy rule, e.g. /api=https://api.example.com
 -h, --help                       Show help
 ```
 
@@ -265,8 +276,6 @@ At a high level:
 - non-Linux platforms use a compatibility runtime
 - proxied responses preserve client-side keep-alive semantics
 - compatibility-runtime proxies stream upstream bodies directly to the client
-- Linux proxy streaming is being migrated into the `epoll` event loop and is not yet validated on a Linux target in this workspace
-
 The project favors a small codebase and low dependency surface over complete HTTP feature coverage.
 
 <p align="right">(<a href="#pear">back to top</a>)</p>
@@ -277,9 +286,8 @@ The project favors a small codebase and low dependency surface over complete HTT
 
 Current limitations include:
 
-- only `http://` upstream proxy targets are supported
 - request chunked transfer encoding is not supported
-- Linux `epoll` proxy streaming is still under refactor and has not yet been validated on a Linux target in this workspace
+- proxying uses a buffering response path instead of event-loop streaming
 - there is no TLS termination
 - there is no HTTP/2 or advanced cache negotiation support
 
@@ -300,6 +308,8 @@ The current tests cover:
 - request parsing
 - keep-alive behavior decisions
 - proxy response header rewriting
+- HTTP and HTTPS upstream parsing
+- HTTPS upstream proxying with a local TLS server
 - path sanitization
 - runtime config validation
 - streamed static response shape

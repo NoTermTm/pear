@@ -15,3 +15,7 @@ target = "http://127.0.0.1:3000"
 [[proxy]]
 prefix = "/upload"
 target = "http://127.0.0.1:4000"
+
+[[proxy]]
+prefix = "/secure-api"
+target = "https://api.example.com"
