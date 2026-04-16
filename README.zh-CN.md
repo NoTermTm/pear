@@ -313,6 +313,30 @@ cargo test
 - 路径清洗
 - 运行时配置校验
 - 流式静态响应形态
+- 反向代理 query 合并行为（`--proxy /api=http://upstream/base?fixed=1`）
+
+### 使用 oha 做压测评估
+
+先安装 `oha`：
+
+```sh
+cargo install oha
+```
+
+执行压测并输出机器可读报告：
+
+```sh
+python scripts/oha_bench.py \
+  --url http://127.0.0.1:8080/ \
+  --url http://127.0.0.1:8080/api/users \
+  --requests 20000 \
+  --connections 200 \
+  --min-rps 3000 \
+  --max-p99-ms 120 \
+  --max-error-rate 0.01
+```
+
+脚本会输出 `bench/oha_report.json`，并在阈值不达标时返回非 0 退出码，适合接入 CI。
 
 <p align="right">(<a href="#pear">回到顶部</a>)</p>
 

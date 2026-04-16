@@ -313,6 +313,30 @@ The current tests cover:
 - path sanitization
 - runtime config validation
 - streamed static response shape
+- reverse-proxy query merge behavior (`--proxy /api=http://upstream/base?fixed=1`)
+
+### Load Testing With oha
+
+Install `oha` first:
+
+```sh
+cargo install oha
+```
+
+Run a baseline load test and generate a machine-readable report:
+
+```sh
+python scripts/oha_bench.py \
+  --url http://127.0.0.1:8080/ \
+  --url http://127.0.0.1:8080/api/users \
+  --requests 20000 \
+  --connections 200 \
+  --min-rps 3000 \
+  --max-p99-ms 120 \
+  --max-error-rate 0.01
+```
+
+The script writes `bench/oha_report.json` and exits non-zero when thresholds are exceeded, which makes it suitable for CI checks.
 
 <p align="right">(<a href="#pear">back to top</a>)</p>
 
