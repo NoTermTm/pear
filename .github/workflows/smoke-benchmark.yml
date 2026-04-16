@@ -1,0 +1,117 @@
+name: smoke-benchmark
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'scripts/oha_bench.py'
+      - '.github/workflows/smoke-benchmark.yml'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install oha
+        run: |
+          if ! command -v oha >/dev/null 2>&1; then
+            cargo install oha --locked
+          fi
+
+      - name: Build pear
+        run: cargo build --quiet
+
+      - name: Run smoke benchmark (proxy + direct baseline)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bench .ci_tmp_dist
+          echo "ok" > .ci_tmp_dist/index.html
+
+          # backend fixture
+          python3 - <<'PY' &
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          class H(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def do_GET(self):
+                  body = b"ok"
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/plain")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, fmt, *args):
+                  pass
+
+          ThreadingHTTPServer(("127.0.0.1", 39201), H).serve_forever()
+          PY
+          BACKEND_PID=$!
+
+          # proxy under test
+          ./target/debug/pear \
+            --host 127.0.0.1 \
+            --port 39200 \
+            --proxy /api=http://127.0.0.1:39201/backend \
+            .ci_tmp_dist &
+          PEAR_PID=$!
+
+          cleanup() {
+            kill "$PEAR_PID" "$BACKEND_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # wait for services
+          sleep 1
+
+          python3 scripts/oha_bench.py \
+            --url 'http://127.0.0.1:39200/api/users?id=1' \
+            --requests 1000 \
+            --connections 50 \
+            --max-error-rate 0.05 \
+            --out bench/smoke_proxy.json
+
+          python3 scripts/oha_bench.py \
+            --url 'http://127.0.0.1:39201/backend/users?id=1' \
+            --requests 1000 \
+            --connections 50 \
+            --max-error-rate 0.05 \
+            --out bench/smoke_upstream.json
+
+          # extra assertion: proxy path must not have body-read transport errors
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          proxy = json.loads(Path('bench/smoke_proxy.json').read_text())['results'][0]
+          errors = (proxy.get('raw') or {}).get('errorDistribution') or {}
+          body_read_errs = errors.get('error reading a body from connection', 0)
+          if body_read_errs:
+              raise SystemExit(f"FAIL: proxy still has body-read errors: {body_read_errs}")
+          print('No proxy body-read errors detected ✅')
+          PY
+
+      - name: Upload benchmark reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-bench-reports
+          path: bench/*.json
