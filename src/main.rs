@@ -10,10 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustls::{
-    ClientConfig, ClientConnection, RootCertStore, StreamOwned,
-    pki_types::{ServerName, UnixTime},
-};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, pki_types::ServerName};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8080;
@@ -60,6 +57,7 @@ struct Upstream {
     host: String,
     port: u16,
     base_path: String,
+    base_query: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -626,18 +624,25 @@ impl Upstream {
                 "Proxy target must start with http:// or https://: {value}"
             ));
         };
-        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let split_index = rest.find(['/', '?']);
+        let (authority, path_and_query) = match split_index {
+            Some(index) if rest.as_bytes()[index] == b'/' => (&rest[..index], &rest[index + 1..]),
+            Some(index) => (&rest[..index], &rest[index..]),
+            None => (rest, ""),
+        };
         if authority.is_empty() {
             return Err(format!("Missing proxy upstream host: {value}"));
         }
 
         let (host, port) = parse_upstream_authority(authority, default_port)?;
+        let (base_path, base_query) = parse_base_path_and_query(path_and_query);
 
         Ok(Self {
             scheme,
             host,
             port,
-            base_path: normalize_base_path(path),
+            base_path,
+            base_query,
         })
     }
 
@@ -994,12 +999,18 @@ impl UpstreamStream {
 
     fn shutdown_write(&self) -> io::Result<()> {
         match self {
+            // For plain HTTP upstreams we can half-close write to signal request completion.
             Self::Plain(stream) => stream.shutdown(Shutdown::Write),
-            Self::Tls(stream) => stream.sock.shutdown(Shutdown::Write),
+            // For TLS upstreams, shutting down the underlying TCP write side bypasses TLS
+            // close-notify semantics and can trigger premature EOF behavior from some peers.
+            // We keep the TLS connection open and rely on `Connection: close` plus response
+            // framing (Content-Length / EOF) to finish the exchange.
+            Self::Tls(_) => Ok(()),
         }
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn connect_upstream(proxy: &ProxyRule) -> io::Result<UpstreamStream> {
     connect_upstream_with_root_store(proxy, default_root_store())
 }
@@ -1116,13 +1127,17 @@ fn proxy_request_with_root_store(
     let content_length = upstream_content_length(upstream_head);
     let head = rewrite_proxy_response_head(upstream_head, runtime, keep_alive)?;
     let body_start = header_end + 4;
-    if body_start >= received.len() {
+    if content_length == Some(0) {
         return Ok(Response::new(head));
     }
 
     let mut temp = TempBodyFile::new()?;
-    temp.write_all(&received[body_start..])?;
-    copy_upstream_body(&mut upstream, &mut temp, received.len() - body_start, content_length)?;
+    let mut copied = 0;
+    if body_start < received.len() {
+        temp.write_all(&received[body_start..])?;
+        copied = received.len() - body_start;
+    }
+    copy_upstream_body(&mut upstream, &mut temp, copied, content_length)?;
     temp.rewind()?;
     Ok(Response::with_temp_body(head, temp))
 }
@@ -1285,18 +1300,54 @@ fn connection_headers(runtime: &RuntimeConfig, keep_alive: bool) -> String {
 }
 
 fn proxied_target(target: &str, proxy: &ProxyRule) -> String {
+    let (path, request_query) = target.split_once('?').unwrap_or((target, ""));
+    let merged_query = merge_queries(proxy.upstream.base_query.as_deref(), request_query);
+
     if proxy.upstream.base_path == "/" {
-        return target.to_string();
+        let mut next = path.to_string();
+        if let Some(query) = merged_query {
+            next.push('?');
+            next.push_str(&query);
+        }
+        return next;
     }
 
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let suffix = path.strip_prefix(&proxy.prefix).unwrap_or(path);
     let mut next = join_url_paths(&proxy.upstream.base_path, suffix);
-    if !query.is_empty() {
+    if let Some(query) = merged_query {
         next.push('?');
-        next.push_str(query);
+        next.push_str(&query);
     }
     next
+}
+
+fn merge_queries(base_query: Option<&str>, request_query: &str) -> Option<String> {
+    let has_base = base_query.is_some_and(|value| !value.is_empty());
+    let has_request = !request_query.is_empty();
+
+    match (has_base, has_request) {
+        (false, false) => None,
+        (true, false) => base_query.map(str::to_string),
+        (false, true) => Some(request_query.to_string()),
+        (true, true) => Some(format!(
+            "{}&{}",
+            base_query.expect("base query should exist when has_base is true"),
+            request_query
+        )),
+    }
+}
+
+fn parse_base_path_and_query(path_and_query: &str) -> (String, Option<String>) {
+    let (path, query) = path_and_query
+        .split_once('?')
+        .unwrap_or((path_and_query, ""));
+    let base_path = normalize_base_path(path);
+    let base_query = if query.is_empty() {
+        None
+    } else {
+        Some(query.to_string())
+    };
+    (base_path, base_query)
 }
 
 fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
@@ -2449,18 +2500,31 @@ mod linux {
                     }
                 }
 
-                if !close_now
-                    && conn.head_written == conn.write_head.len()
-                    && conn.write_body.flush_to(&mut conn.stream)?
-                {
-                    conn.write_head.clear();
-                    conn.head_written = 0;
-                    conn.write_body = PendingBody::empty();
-                    conn.last_active = Instant::now();
-                    if conn.close_after_write || conn.peer_closed {
-                        close_now = true;
-                    } else if !conn.read_buf.is_empty() {
-                        parse_next = true;
+                if !close_now && conn.head_written == conn.write_head.len() {
+                    match conn.write_body.flush_to(&mut conn.stream) {
+                        Ok(true) => {
+                            conn.write_head.clear();
+                            conn.head_written = 0;
+                            conn.write_body = PendingBody::empty();
+                            conn.last_active = Instant::now();
+                            if conn.close_after_write || conn.peer_closed {
+                                close_now = true;
+                            } else if !conn.read_buf.is_empty() {
+                                parse_next = true;
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                ErrorKind::BrokenPipe
+                                    | ErrorKind::ConnectionReset
+                                    | ErrorKind::ConnectionAborted
+                            ) =>
+                        {
+                            close_now = true;
+                        }
+                        Err(err) => return Err(err),
                     }
                 }
             }
@@ -2755,6 +2819,27 @@ mod tests {
     }
 
     #[test]
+    fn proxied_target_merges_fixed_upstream_query_with_request_query() {
+        let proxy = ProxyRule::new("/api", "http://127.0.0.1:3000/backend?fixed=1")
+            .expect("proxy rule should parse");
+        assert_eq!(
+            proxied_target("/api/users?id=1&name=test", &proxy),
+            "/backend/users?fixed=1&id=1&name=test"
+        );
+    }
+
+    #[test]
+    fn proxied_target_preserves_prefix_for_root_upstream_and_appends_fixed_query() {
+        let proxy = ProxyRule::new("/api", "http://127.0.0.1:3000?fixed=1")
+            .expect("proxy rule should parse");
+        assert_eq!(proxied_target("/api/users", &proxy), "/api/users?fixed=1");
+        assert_eq!(
+            proxied_target("/api/users?id=1", &proxy),
+            "/api/users?fixed=1&id=1"
+        );
+    }
+
+    #[test]
     fn missing_spa_fallback_index_returns_404_instead_of_io_error() {
         let root = std::env::temp_dir().join(format!(
             "pear-test-missing-index-{}-{}",
@@ -2788,16 +2873,8 @@ mod tests {
             ErrorKind::UnexpectedEof,
             "peer closed connection without sending TLS close_notify",
         );
-        assert!(should_treat_upstream_eof_as_clean_close(
-            &err,
-            5,
-            Some(5)
-        ));
-        assert!(!should_treat_upstream_eof_as_clean_close(
-            &err,
-            4,
-            Some(5)
-        ));
+        assert!(should_treat_upstream_eof_as_clean_close(&err, 5, Some(5)));
+        assert!(!should_treat_upstream_eof_as_clean_close(&err, 4, Some(5)));
         assert!(should_treat_upstream_eof_as_clean_close(&err, 1, None));
     }
 
@@ -2811,6 +2888,64 @@ mod tests {
         assert_eq!(proxy.upstream.port, 443);
         assert_eq!(proxy.upstream.base_path, "/base");
         assert_eq!(proxy.upstream.authority_header(), "localhost");
+    }
+
+    #[test]
+    fn proxy_request_handles_split_header_and_body_reads() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener addr should exist")
+            .port();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            ready_tx.send(()).expect("ready signal should send");
+            let (mut stream, _) = listener.accept().expect("upstream should accept");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("request should read");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if find_header_end(&request).is_some() {
+                    break;
+                }
+            }
+
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+                .expect("response head should write");
+            stream.flush().expect("response head should flush");
+            thread::sleep(std::time::Duration::from_millis(20));
+            stream
+                .write_all(b"hello")
+                .expect("response body should write");
+            stream.flush().expect("response body should flush");
+        });
+        ready_rx.recv().expect("ready signal should arrive");
+
+        let proxy = ProxyRule::new("/api", &format!("http://127.0.0.1:{port}/secure"))
+            .expect("http proxy should parse");
+        let request = Request {
+            method: "GET".to_string(),
+            target: "/api".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Host".to_string(), "pear.local".to_string())],
+            body: Vec::new(),
+        };
+
+        let response =
+            proxy_request_with_root_store(&request, &proxy, &runtime(), true, RootCertStore::empty())
+                .expect("http proxy request should succeed");
+        let text = String::from_utf8(response.head.clone()).expect("head should be utf8");
+        let body = read_response_body(response);
+
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Length: 5\r\n"));
+        assert_eq!(body, b"hello");
+        handle.join().expect("http upstream thread should finish");
     }
 
     #[test]
