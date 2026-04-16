@@ -1,3 +1,4 @@
 /target
+/bench
 .DS_Store
 config.toml
