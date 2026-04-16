@@ -34,6 +34,7 @@ struct Config {
     spa_fallback: bool,
     proxies: Vec<ProxyRule>,
     runtime: RuntimeConfig,
+    error_pages: ErrorPages,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +44,28 @@ struct RuntimeConfig {
     max_events: usize,
     max_connections: usize,
     max_request_size: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ErrorPages {
+    entries: Vec<(u16, PathBuf)>,
+}
+
+impl ErrorPages {
+    fn set(&mut self, status: u16, path: PathBuf) {
+        if let Some((_, existing)) = self.entries.iter_mut().find(|(code, _)| *code == status) {
+            *existing = path;
+            return;
+        }
+        self.entries.push((status, path));
+    }
+
+    fn get(&self, status: u16) -> Option<&Path> {
+        self.entries
+            .iter()
+            .find(|(code, _)| *code == status)
+            .map(|(_, path)| path.as_path())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +224,14 @@ impl Config {
                         .ok_or_else(|| "Missing value for --max-request-size".to_string())?;
                     config.runtime.max_request_size = parse_usize_arg(value, "--max-request-size")?;
                 }
+                "--error-page" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "Missing value for --error-page".to_string())?;
+                    let (status, page_path) = parse_error_page_arg(value)?;
+                    config.error_pages.set(status, page_path);
+                }
                 "--proxy" => {
                     index += 1;
                     let value = args
@@ -229,6 +260,7 @@ impl Config {
             spa_fallback: true,
             proxies: Vec::new(),
             runtime: RuntimeConfig::default_values(),
+            error_pages: ErrorPages::default(),
         })
     }
 
@@ -331,6 +363,11 @@ impl Config {
             }
             "max_request_size" => {
                 self.runtime.max_request_size = parse_usize(value, path, line_number)?
+            }
+            _ if key.starts_with("error_page_") => {
+                let status = parse_error_page_key(key)?;
+                let page_path = parse_string(value, path, line_number)?;
+                self.error_pages.set(status, PathBuf::from(page_path));
             }
             _ => {
                 return Err(format!(
@@ -536,6 +573,40 @@ fn parse_usize_arg(value: &str, option: &str) -> Result<usize, String> {
     value
         .parse()
         .map_err(|_| format!("Invalid value for {option}: {value}"))
+}
+
+fn parse_error_page_arg(value: &str) -> Result<(u16, PathBuf), String> {
+    let (status_raw, path_raw) = value
+        .split_once('=')
+        .ok_or_else(|| format!("Invalid value for --error-page: {value} (expected STATUS=PATH)"))?;
+    let status = parse_error_status(status_raw)
+        .map_err(|err| format!("Invalid value for --error-page: {err}"))?;
+    let path = path_raw.trim();
+    if path.is_empty() {
+        return Err(format!(
+            "Invalid value for --error-page: missing path in '{value}'"
+        ));
+    }
+    Ok((status, PathBuf::from(path)))
+}
+
+fn parse_error_page_key(key: &str) -> Result<u16, String> {
+    let Some(raw_status) = key.strip_prefix("error_page_") else {
+        return Err(format!("unsupported config key: {key}"));
+    };
+    parse_error_status(raw_status)
+        .map_err(|err| format!("unsupported config key: {key} ({err})"))
+}
+
+fn parse_error_status(value: &str) -> Result<u16, String> {
+    let status = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("status must be an integer, got: {value}"))?;
+    if !(400..=599).contains(&status) {
+        return Err(format!("status must be between 400 and 599, got: {status}"));
+    }
+    Ok(status)
 }
 
 fn default_max_connections() -> usize {
@@ -770,17 +841,19 @@ fn handle_request(
     spa_fallback: bool,
     proxies: &[ProxyRule],
     runtime: &RuntimeConfig,
+    error_pages: &ErrorPages,
     keep_alive: bool,
 ) -> io::Result<Response> {
     if let Some(proxy) = find_proxy(proxies, &request.target) {
         if has_chunked_transfer_encoding(request) {
-            return Ok(Response::close(build_response(
+            return Ok(Response::close(build_error_response(
                 501,
                 "Not Implemented",
-                "text/plain",
                 b"Chunked transfer encoding is not supported",
                 false,
                 runtime,
+                root,
+                error_pages,
             )));
         }
 
@@ -788,19 +861,20 @@ fn handle_request(
             Ok(response) => Ok(response),
             Err(err) => {
                 eprintln!("Proxy request failed: {err}");
-                Ok(Response::close(build_response(
+                Ok(Response::close(build_error_response(
                     502,
                     "Bad Gateway",
-                    "text/plain",
                     b"Bad Gateway",
                     false,
                     runtime,
+                    root,
+                    error_pages,
                 )))
             }
         };
     }
 
-    serve_static(request, root, spa_fallback, runtime, keep_alive)
+    serve_static(request, root, spa_fallback, runtime, error_pages, keep_alive)
 }
 
 fn wants_keep_alive(request: &Request) -> bool {
@@ -817,27 +891,30 @@ fn serve_static(
     root: &Path,
     spa_fallback: bool,
     runtime: &RuntimeConfig,
+    error_pages: &ErrorPages,
     keep_alive: bool,
 ) -> io::Result<Response> {
     if request.method != "GET" && request.method != "HEAD" {
-        return Ok(Response::new(build_response(
+        return Ok(Response::new(build_error_response(
             405,
             "Method Not Allowed",
-            "text/plain",
             b"Method Not Allowed",
             keep_alive,
             runtime,
+            root,
+            error_pages,
         )));
     }
 
     let Some(request_path) = clean_request_path(&request.target) else {
-        return Ok(Response::new(build_response(
+        return Ok(Response::new(build_error_response(
             400,
             "Bad Request",
-            "text/plain",
             b"Bad Request",
             false,
             runtime,
+            root,
+            error_pages,
         )));
     };
 
@@ -852,25 +929,27 @@ fn serve_static(
                     match fs::metadata(&path) {
                         Ok(meta) if meta.is_file() => (path, meta),
                         _ => {
-                            return Ok(Response::new(build_response(
+                            return Ok(Response::new(build_error_response(
                                 404,
                                 "Not Found",
-                                "text/plain",
                                 b"Not Found",
                                 keep_alive,
                                 runtime,
+                                root,
+                                error_pages,
                             )));
                         }
                     }
                 }
                 _ => {
-                    return Ok(Response::new(build_response(
+                    return Ok(Response::new(build_error_response(
                         404,
                         "Not Found",
-                        "text/plain",
                         b"Not Found",
                         keep_alive,
                         runtime,
+                        root,
+                        error_pages,
                     )));
                 }
             }
@@ -881,37 +960,40 @@ fn serve_static(
             match fs::metadata(&path) {
                 Ok(meta) if meta.is_file() => (path, meta),
                 _ => {
-                    return Ok(Response::new(build_response(
+                    return Ok(Response::new(build_error_response(
                         404,
                         "Not Found",
-                        "text/plain",
                         b"Not Found",
                         keep_alive,
                         runtime,
+                        root,
+                        error_pages,
                     )));
                 }
             }
         }
         _ => {
-            return Ok(Response::new(build_response(
+            return Ok(Response::new(build_error_response(
                 404,
                 "Not Found",
-                "text/plain",
                 b"Not Found",
                 keep_alive,
                 runtime,
+                root,
+                error_pages,
             )));
         }
     };
 
     if !is_inside(root, &file_path) {
-        return Ok(Response::new(build_response(
+        return Ok(Response::new(build_error_response(
             404,
             "Not Found",
-            "text/plain",
             b"Not Found",
             keep_alive,
             runtime,
+            root,
+            error_pages,
         )));
     }
 
@@ -1474,6 +1556,51 @@ fn build_response(
     bytes
 }
 
+fn build_error_response(
+    status: u16,
+    reason: &str,
+    default_body: &[u8],
+    keep_alive: bool,
+    runtime: &RuntimeConfig,
+    root: &Path,
+    error_pages: &ErrorPages,
+) -> Vec<u8> {
+    if let Some(configured_path) = error_pages.get(status) {
+        let full_path = if configured_path.is_absolute() {
+            configured_path.to_path_buf()
+        } else {
+            root.join(configured_path)
+        };
+        match fs::read(&full_path) {
+            Ok(body) => {
+                return build_response(
+                    status,
+                    reason,
+                    content_type(&full_path),
+                    &body,
+                    keep_alive,
+                    runtime,
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "Cannot read custom error page for {status} at '{}': {err}",
+                    full_path.display()
+                );
+            }
+        }
+    }
+
+    build_response(
+        status,
+        reason,
+        "text/plain",
+        default_body,
+        keep_alive,
+        runtime,
+    )
+}
+
 fn build_head_response(
     status: u16,
     reason: &str,
@@ -1539,6 +1666,8 @@ fn print_usage() {
                                 Max open client connections, default auto-detected\n\
                --max-request-size <BYTES>\n\
                                 Max request size, default 1048576\n\
+               --error-page <STATUS=PATH>\n\
+                                Custom page for 4xx/5xx status, repeatable\n\
                --no-spa         Disable fallback to index.html\n\
                --proxy <RULE>   Reverse proxy rule, e.g. /api=https://api.example.com\n\
            -h, --help           Show this help\n\n\
@@ -1752,6 +1881,7 @@ mod compat {
         let root = Arc::new(root);
         let proxies = Arc::new(config.proxies);
         let runtime = Arc::new(config.runtime);
+        let error_pages = Arc::new(config.error_pages);
 
         for stream in listener.incoming() {
             let stream = match stream {
@@ -1770,15 +1900,21 @@ mod compat {
             let root = Arc::clone(&root);
             let proxies = Arc::clone(&proxies);
             let runtime = Arc::clone(&runtime);
+            let error_pages = Arc::clone(&error_pages);
             let spa_fallback = config.spa_fallback;
 
             let spawn = thread::Builder::new()
                 .stack_size(HANDLER_STACK_SIZE)
                 .spawn(move || {
                     ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-                    if let Err(err) =
-                        handle_connection(stream, &root, spa_fallback, &proxies, &runtime)
-                    {
+                    if let Err(err) = handle_connection(
+                        stream,
+                        &root,
+                        spa_fallback,
+                        &proxies,
+                        &runtime,
+                        &error_pages,
+                    ) {
                         eprintln!("Request failed: {err}");
                     }
                     ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
@@ -1798,6 +1934,7 @@ mod compat {
         spa_fallback: bool,
         proxies: &[ProxyRule],
         runtime: &RuntimeConfig,
+        error_pages: &ErrorPages,
     ) -> io::Result<()> {
         stream.set_read_timeout(Some(runtime.keep_alive_timeout()))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -1825,13 +1962,14 @@ mod compat {
             let keep_alive = served + 1 < runtime.keep_alive_max && wants_keep_alive(&request);
             if let Some(proxy) = find_proxy(proxies, &request.target) {
                 if has_chunked_transfer_encoding(&request) {
-                    write_stream.write_all(&build_response(
+                    write_stream.write_all(&build_error_response(
                         501,
                         "Not Implemented",
-                        "text/plain",
                         b"Chunked transfer encoding is not supported",
                         false,
                         runtime,
+                        root,
+                        error_pages,
                     ))?;
                     write_stream.flush()?;
                     break;
@@ -1841,13 +1979,14 @@ mod compat {
                     proxy_request_streaming(&request, proxy, runtime, keep_alive, &mut write_stream)
                 {
                     eprintln!("Proxy request failed: {err}");
-                    write_stream.write_all(&build_response(
+                    write_stream.write_all(&build_error_response(
                         502,
                         "Bad Gateway",
-                        "text/plain",
                         b"Bad Gateway",
                         false,
                         runtime,
+                        root,
+                        error_pages,
                     ))?;
                     write_stream.flush()?;
                     break;
@@ -1860,8 +1999,15 @@ mod compat {
                 continue;
             }
 
-            let mut response =
-                handle_request(&request, root, spa_fallback, proxies, runtime, keep_alive)?;
+            let mut response = handle_request(
+                &request,
+                root,
+                spa_fallback,
+                proxies,
+                runtime,
+                error_pages,
+                keep_alive,
+            )?;
             write_stream.write_all(&response.head)?;
             stream_response_body(&mut write_stream, &mut response.body)?;
             write_stream.flush()?;
@@ -2021,6 +2167,7 @@ mod linux {
             config.spa_fallback,
             config.proxies,
             config.runtime,
+            config.error_pages,
         )?;
         server.run()
     }
@@ -2268,6 +2415,7 @@ mod linux {
         spa_fallback: bool,
         proxies: Vec<ProxyRule>,
         runtime: RuntimeConfig,
+        error_pages: ErrorPages,
         connections: HashMap<RawFd, Connection>,
     }
 
@@ -2278,6 +2426,7 @@ mod linux {
             spa_fallback: bool,
             proxies: Vec<ProxyRule>,
             runtime: RuntimeConfig,
+            error_pages: ErrorPages,
         ) -> io::Result<Self> {
             let epoll = Epoll::new()?;
             let listener_fd = listener.as_raw_fd();
@@ -2291,6 +2440,7 @@ mod linux {
                 spa_fallback,
                 proxies,
                 runtime,
+                error_pages,
                 connections: HashMap::new(),
             })
         }
@@ -2376,13 +2526,14 @@ mod linux {
                             conn.last_active = Instant::now();
                             conn.read_buf.extend_from_slice(&buf[..read]);
                             if conn.read_buf.len() > self.runtime.max_request_size {
-                                conn.write_head = build_response(
+                                conn.write_head = build_error_response(
                                     413,
                                     "Payload Too Large",
-                                    "text/plain",
                                     b"Payload Too Large",
                                     false,
                                     &self.runtime,
+                                    &self.root,
+                                    &self.error_pages,
                                 );
                                 conn.head_written = 0;
                                 conn.write_body = PendingBody::empty();
@@ -2403,13 +2554,14 @@ mod linux {
                                 Ok(None) => {}
                                 Err(err) => {
                                     eprintln!("Request parse failed: {err}");
-                                    conn.write_head = build_response(
+                                    conn.write_head = build_error_response(
                                         400,
                                         "Bad Request",
-                                        "text/plain",
                                         b"Bad Request",
                                         false,
                                         &self.runtime,
+                                        &self.root,
+                                        &self.error_pages,
                                     );
                                     conn.head_written = 0;
                                     conn.write_body = PendingBody::empty();
@@ -2457,6 +2609,7 @@ mod linux {
                 self.spa_fallback,
                 &self.proxies,
                 &self.runtime,
+                &self.error_pages,
                 keep_alive,
             )?;
 
@@ -2548,13 +2701,14 @@ mod linux {
                         Ok(None) => None,
                         Err(err) => {
                             eprintln!("Request parse failed: {err}");
-                            conn.write_head = build_response(
+                            conn.write_head = build_error_response(
                                 400,
                                 "Bad Request",
-                                "text/plain",
                                 b"Bad Request",
                                 false,
                                 &self.runtime,
+                                &self.root,
+                                &self.error_pages,
                             );
                             conn.head_written = 0;
                             conn.write_body = PendingBody::empty();
@@ -2652,6 +2806,10 @@ mod tests {
             max_connections: 1024,
             max_request_size: 1024 * 1024,
         }
+    }
+
+    fn empty_error_pages() -> ErrorPages {
+        ErrorPages::default()
     }
 
     fn request(version: &str, connection: Option<&str>) -> Request {
@@ -2859,11 +3017,331 @@ mod tests {
             body: Vec::new(),
         };
 
-        let response =
-            serve_static(&request, &canonical_root, true, &runtime(), true).expect("response");
+        let response = serve_static(
+            &request,
+            &canonical_root,
+            true,
+            &runtime(),
+            &empty_error_pages(),
+            true,
+        )
+        .expect("response");
         let text = String::from_utf8(response.head).expect("response should be utf8");
         assert!(text.starts_with("HTTP/1.1 404 Not Found\r\n"));
 
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn build_error_response_uses_configured_page_for_400() {
+        let root = std::env::temp_dir().join(format!(
+            "pear-test-custom-400-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let errors = root.join("errors");
+        fs::create_dir_all(&errors).expect("errors dir should be created");
+        let page = errors.join("400.html");
+        fs::write(&page, b"<h1>custom bad request</h1>").expect("error page should write");
+        let canonical_root = fs::canonicalize(&root).expect("root should canonicalize");
+
+        let mut error_pages = ErrorPages::default();
+        error_pages.set(400, PathBuf::from("errors/400.html"));
+
+        let response = build_error_response(
+            400,
+            "Bad Request",
+            b"Bad Request",
+            false,
+            &runtime(),
+            &canonical_root,
+            &error_pages,
+        );
+        let text = String::from_utf8(response).expect("response should be utf8");
+
+        assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(text.ends_with("\r\n<h1>custom bad request</h1>"));
+
+        let _ = fs::remove_file(page);
+        let _ = fs::remove_dir(errors);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn build_error_response_falls_back_to_default_when_custom_500_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "pear-test-custom-500-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("temp root should be created");
+        let canonical_root = fs::canonicalize(&root).expect("root should canonicalize");
+
+        let mut error_pages = ErrorPages::default();
+        error_pages.set(500, PathBuf::from("errors/500.html"));
+
+        let response = build_error_response(
+            500,
+            "Internal Server Error",
+            b"Internal Server Error",
+            false,
+            &runtime(),
+            &canonical_root,
+            &error_pages,
+        );
+        let text = String::from_utf8(response).expect("response should be utf8");
+
+        assert!(text.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+        assert!(text.contains("Content-Type: text/plain\r\n"));
+        assert!(text.ends_with("\r\nInternal Server Error"));
+
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn build_error_response_uses_configured_page_for_413() {
+        let root = std::env::temp_dir().join(format!(
+            "pear-test-custom-413-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let errors = root.join("errors");
+        fs::create_dir_all(&errors).expect("errors dir should be created");
+        let page = errors.join("413.html");
+        fs::write(&page, b"<h1>custom payload too large</h1>").expect("error page should write");
+        let canonical_root = fs::canonicalize(&root).expect("root should canonicalize");
+
+        let mut error_pages = ErrorPages::default();
+        error_pages.set(413, PathBuf::from("errors/413.html"));
+
+        let response = build_error_response(
+            413,
+            "Payload Too Large",
+            b"Payload Too Large",
+            false,
+            &runtime(),
+            &canonical_root,
+            &error_pages,
+        );
+        let text = String::from_utf8(response).expect("response should be utf8");
+
+        assert!(text.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+        assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(text.ends_with("\r\n<h1>custom payload too large</h1>"));
+
+        let _ = fs::remove_file(page);
+        let _ = fs::remove_dir(errors);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn serve_static_uses_custom_404_page() {
+        let root = std::env::temp_dir().join(format!(
+            "pear-test-custom-404-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let errors = root.join("errors");
+        fs::create_dir_all(&errors).expect("errors dir should be created");
+        let page = errors.join("404.html");
+        fs::write(&page, b"<h1>custom not found</h1>").expect("error page should write");
+        let canonical_root = fs::canonicalize(&root).expect("root should canonicalize");
+
+        let mut error_pages = ErrorPages::default();
+        error_pages.set(404, PathBuf::from("errors/404.html"));
+
+        let request = Request {
+            method: "GET".to_string(),
+            target: "/missing".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+
+        let response = serve_static(
+            &request,
+            &canonical_root,
+            false,
+            &runtime(),
+            &error_pages,
+            true,
+        )
+        .expect("response");
+        let text = String::from_utf8(response.head).expect("response should be utf8");
+
+        assert!(text.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(text.ends_with("\r\n<h1>custom not found</h1>"));
+
+        let _ = fs::remove_file(page);
+        let _ = fs::remove_dir(errors);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn serve_static_uses_custom_405_page_for_unsupported_method() {
+        let root = std::env::temp_dir().join(format!(
+            "pear-test-custom-405-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let errors = root.join("errors");
+        fs::create_dir_all(&errors).expect("errors dir should be created");
+        let page = errors.join("405.html");
+        fs::write(&page, b"<h1>custom method not allowed</h1>").expect("error page should write");
+        let canonical_root = fs::canonicalize(&root).expect("root should canonicalize");
+
+        let mut error_pages = ErrorPages::default();
+        error_pages.set(405, PathBuf::from("errors/405.html"));
+
+        let request = Request {
+            method: "POST".to_string(),
+            target: "/".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+
+        let response = serve_static(
+            &request,
+            &canonical_root,
+            true,
+            &runtime(),
+            &error_pages,
+            true,
+        )
+        .expect("response");
+        let text = String::from_utf8(response.head).expect("response should be utf8");
+
+        assert!(text.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+        assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(text.ends_with("\r\n<h1>custom method not allowed</h1>"));
+
+        let _ = fs::remove_file(page);
+        let _ = fs::remove_dir(errors);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn handle_request_uses_custom_501_for_chunked_proxy_request() {
+        let root = std::env::temp_dir().join(format!(
+            "pear-test-custom-501-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let errors = root.join("errors");
+        fs::create_dir_all(&errors).expect("errors dir should be created");
+        let page = errors.join("501.html");
+        fs::write(&page, b"<h1>custom not implemented</h1>").expect("error page should write");
+        let canonical_root = fs::canonicalize(&root).expect("root should canonicalize");
+
+        let mut error_pages = ErrorPages::default();
+        error_pages.set(501, PathBuf::from("errors/501.html"));
+
+        let proxy =
+            ProxyRule::new("/api", "http://127.0.0.1:6553").expect("proxy rule should parse");
+        let request = Request {
+            method: "POST".to_string(),
+            target: "/api/upload".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Transfer-Encoding".to_string(), "chunked".to_string())],
+            body: Vec::new(),
+        };
+
+        let response = handle_request(
+            &request,
+            &canonical_root,
+            true,
+            &[proxy],
+            &runtime(),
+            &error_pages,
+            false,
+        )
+        .expect("response");
+        let text = String::from_utf8(response.head).expect("response should be utf8");
+
+        assert!(text.starts_with("HTTP/1.1 501 Not Implemented\r\n"));
+        assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(text.ends_with("\r\n<h1>custom not implemented</h1>"));
+
+        let _ = fs::remove_file(page);
+        let _ = fs::remove_dir(errors);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn handle_request_uses_custom_502_for_proxy_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "pear-test-custom-502-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let errors = root.join("errors");
+        fs::create_dir_all(&errors).expect("errors dir should be created");
+        let page = errors.join("502.html");
+        fs::write(&page, b"<h1>custom bad gateway</h1>").expect("error page should write");
+        let canonical_root = fs::canonicalize(&root).expect("root should canonicalize");
+
+        let mut error_pages = ErrorPages::default();
+        error_pages.set(502, PathBuf::from("errors/502.html"));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener addr should exist")
+            .port();
+        drop(listener);
+
+        let proxy = ProxyRule::new("/api", &format!("http://127.0.0.1:{port}"))
+            .expect("proxy rule should parse");
+        let request = Request {
+            method: "GET".to_string(),
+            target: "/api/users".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+
+        let response = handle_request(
+            &request,
+            &canonical_root,
+            true,
+            &[proxy],
+            &runtime(),
+            &error_pages,
+            false,
+        )
+        .expect("response");
+        let text = String::from_utf8(response.head).expect("response should be utf8");
+
+        assert!(text.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(text.ends_with("\r\n<h1>custom bad gateway</h1>"));
+
+        let _ = fs::remove_file(page);
+        let _ = fs::remove_dir(errors);
         let _ = fs::remove_dir(root);
     }
 
@@ -3030,8 +3508,15 @@ mod tests {
             body: Vec::new(),
         };
 
-        let response = serve_static(&request, &canonical_root, true, &runtime(), true)
-            .expect("static response");
+        let response = serve_static(
+            &request,
+            &canonical_root,
+            true,
+            &runtime(),
+            &empty_error_pages(),
+            true,
+        )
+        .expect("static response");
 
         assert!(response.head.starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(response.head.ends_with(b"\r\nhello world"));
@@ -3069,8 +3554,15 @@ mod tests {
             body: Vec::new(),
         };
 
-        let response = serve_static(&request, &canonical_root, true, &runtime(), true)
-            .expect("static response");
+        let response = serve_static(
+            &request,
+            &canonical_root,
+            true,
+            &runtime(),
+            &empty_error_pages(),
+            true,
+        )
+        .expect("static response");
 
         assert!(response.head.starts_with(b"HTTP/1.1 200 OK\r\n"));
         match response.body {

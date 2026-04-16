@@ -167,6 +167,8 @@ keep_alive_max = 100
 max_events = 256
 max_connections = 4096
 max_request_size = 1048576
+error_page_404 = "./errors/404.html"
+error_page_502 = "./errors/502.html"
 
 [[proxy]]
 prefix = "/api"
@@ -201,6 +203,7 @@ target = "https://api.example.com"
 - `max_events`：Linux 下 `epoll_wait` 每次提取的最大事件数
 - `max_connections`：最大并发客户端连接数
 - `max_request_size`：最大请求大小，单位字节
+- `error_page_<status>`：指定状态码的自定义错误页路径（支持 400..599，例如 `error_page_404 = "./errors/404.html"`）
 
 ### 命令行参数
 
@@ -214,6 +217,7 @@ target = "https://api.example.com"
     --max-events <N>             Linux 下 epoll 批量事件数，默认 256
     --max-connections <N>        最大客户端连接数，默认自动推导
     --max-request-size <BYTES>   最大请求大小，默认 1048576
+    --error-page <STATUS=PATH>   为 4xx/5xx 状态码指定自定义页面（可重复）
     --no-spa                     关闭 index.html 回退
     --proxy <RULE>               反向代理规则，例如 /api=https://api.example.com
 -h, --help                       显示帮助
@@ -222,6 +226,32 @@ target = "https://api.example.com"
 CLI 中的标量参数会覆盖配置文件里的同名值，例如 `port`、`root`、`max_connections`。
 
 CLI 中多个 `--proxy` 会追加到配置文件已有的代理规则后面。
+
+### 自定义错误页示例
+
+CLI：
+
+```sh
+pear \
+  --error-page 404=./errors/404.html \
+  --error-page 502=./errors/502.html \
+  --proxy /api=http://127.0.0.1:3000 \
+  ./dist
+```
+
+`config.toml`：
+
+```toml
+root = "./dist"
+spa_fallback = true
+error_page_404 = "./errors/404.html"
+error_page_405 = "./errors/405.html"
+error_page_413 = "./errors/413.html"
+error_page_501 = "./errors/501.html"
+error_page_502 = "./errors/502.html"
+```
+
+当前已接入的内置错误路径是 `400/404/405/413/501/502`。
 
 <p align="right">(<a href="#pear">回到顶部</a>)</p>
 
@@ -289,7 +319,7 @@ CLI 中多个 `--proxy` 会追加到配置文件已有的代理规则后面。
 - 不支持 request 侧的 chunked transfer encoding
 - 代理响应目前走缓冲转发路径，不走事件循环内的流式转发
 - 不支持 TLS 终止
-- 不支持可配置的自定义错误页（例如 404/500 HTML 页面）
+- 已支持可配置自定义错误页（4xx/5xx 均可配置）；当前内置错误路径已接入 400/404/405/413/501/502
 - 不支持 HTTP/2 和更完整的缓存协商
 
 对于前端预览、同源 API 联调和小规模部署，这些限制通常是可以接受的。
@@ -323,6 +353,7 @@ cargo test
 - 运行时配置校验
 - 流式静态响应形态
 - 反向代理 query 合并行为（`--proxy /api=http://upstream/base?fixed=1`）
+- 自定义错误页行为（命中配置页 + 配置页缺失时回退默认正文）
 
 ### 使用 oha 做压测评估
 
@@ -360,7 +391,7 @@ python scripts/oha_bench.py \
 - [x] 为兼容运行时增加代理流式转发
 - [ ] 完成并验证 Linux `epoll` 下的代理流式转发
 - [ ] 支持更友好的大小和时间配置语法
-- [ ] 可选支持可配置自定义错误页（例如 404/500）
+- [x] 可选支持可配置自定义错误页（例如 404/500；当前已接入路径包含 400/404/405/413/501/502）
 - [ ] 增加端到端集成测试
 
 <p align="right">(<a href="#pear">回到顶部</a>)</p>

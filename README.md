@@ -171,6 +171,8 @@ keep_alive_max = 100
 max_events = 256
 max_connections = 4096
 max_request_size = 1048576
+error_page_404 = "./errors/404.html"
+error_page_502 = "./errors/502.html"
 
 [[proxy]]
 prefix = "/api"
@@ -205,6 +207,7 @@ The proxy section also supports a compact map style:
 - `max_events`: Linux `epoll_wait` batch size
 - `max_connections`: maximum concurrent client connections
 - `max_request_size`: request size limit in bytes
+- `error_page_<status>`: custom error page path for a status code (supports 400..599, for example `error_page_404 = "./errors/404.html"`)
 
 ### CLI Options
 
@@ -218,6 +221,7 @@ The proxy section also supports a compact map style:
     --max-events <N>             epoll batch size on Linux, default 256
     --max-connections <N>        Max open client connections, default auto-detected
     --max-request-size <BYTES>   Max request size, default 1048576
+    --error-page <STATUS=PATH>   Custom page for 4xx/5xx status (repeatable)
     --no-spa                     Disable fallback to index.html
     --proxy <RULE>               Reverse proxy rule, e.g. /api=https://api.example.com
 -h, --help                       Show help
@@ -226,6 +230,32 @@ The proxy section also supports a compact map style:
 CLI scalar options override config file values such as `port`, `root`, and runtime limits.
 
 CLI `--proxy` options are appended to proxy rules loaded from the config file.
+
+### Custom Error Page Examples
+
+CLI:
+
+```sh
+pear \
+  --error-page 404=./errors/404.html \
+  --error-page 502=./errors/502.html \
+  --proxy /api=http://127.0.0.1:3000 \
+  ./dist
+```
+
+`config.toml`:
+
+```toml
+root = "./dist"
+spa_fallback = true
+error_page_404 = "./errors/404.html"
+error_page_405 = "./errors/405.html"
+error_page_413 = "./errors/413.html"
+error_page_501 = "./errors/501.html"
+error_page_502 = "./errors/502.html"
+```
+
+Currently wired built-in error paths are `400/404/405/413/501/502`.
 
 <p align="right">(<a href="#pear">back to top</a>)</p>
 
@@ -291,7 +321,7 @@ Current limitations include:
 - request chunked transfer encoding is not supported
 - proxying uses a buffering response path instead of event-loop streaming
 - there is no TLS termination
-- configurable custom error pages (for example 404/500 HTML pages) are not supported
+- configurable custom error pages are supported for configured 4xx/5xx codes; current built-in error paths cover 400/404/405/413/501/502
 - there is no HTTP/2 or advanced cache negotiation support
 
 For frontend preview, same-origin local API proxying, and small deployments, these tradeoffs are often acceptable.
@@ -325,6 +355,7 @@ The current tests cover:
 - runtime config validation
 - streamed static response shape
 - reverse-proxy query merge behavior (`--proxy /api=http://upstream/base?fixed=1`)
+- custom error page behavior (configured page hit + fallback to default body on missing page)
 
 ### Load Testing With oha
 
@@ -362,7 +393,7 @@ The script writes `bench/oha_report.json` and exits non-zero when thresholds are
 - [x] Add streaming proxy forwarding on the compatibility runtime
 - [ ] Finish and validate streaming proxy forwarding on Linux `epoll`
 - [ ] Support friendlier size and duration syntax in config and CLI
-- [ ] Optional configurable custom error pages (for example 404/500)
+- [x] Optional configurable custom error pages (for example 404/500; currently wired paths include 400/404/405/413/501/502)
 - [ ] Improve end-to-end integration tests
 
 <p align="right">(<a href="#pear">back to top</a>)</p>
