@@ -24,6 +24,8 @@ A small Rust static file server for frontend build output, with SPA fallback, re
 
 `pear` is built for frontend-oriented workflows where one small binary is more useful than a full web framework stack.
 
+It is primarily intended for local or private-network testing and deployment.
+
 It focuses on a narrow but practical use case:
 
 - serve a built frontend directory such as `dist` or `build`
@@ -289,9 +291,18 @@ Current limitations include:
 - request chunked transfer encoding is not supported
 - proxying uses a buffering response path instead of event-loop streaming
 - there is no TLS termination
+- configurable custom error pages (for example 404/500 HTML pages) are not supported
 - there is no HTTP/2 or advanced cache negotiation support
 
 For frontend preview, same-origin local API proxying, and small deployments, these tradeoffs are often acceptable.
+
+### HTTPS for local/private deployments
+
+`pear` intentionally does not terminate TLS. If you need HTTPS (for LAN demos, internal environments, or cert-based testing), place a front proxy such as Caddy or Nginx in front of `pear`:
+
+- edge proxy handles TLS certificates and HTTPS listeners
+- `pear` keeps serving HTTP on an internal/local port
+- keep business logic and static/proxy routing in `pear`
 
 <p align="right">(<a href="#pear">back to top</a>)</p>
 
@@ -351,6 +362,7 @@ The script writes `bench/oha_report.json` and exits non-zero when thresholds are
 - [x] Add streaming proxy forwarding on the compatibility runtime
 - [ ] Finish and validate streaming proxy forwarding on Linux `epoll`
 - [ ] Support friendlier size and duration syntax in config and CLI
+- [ ] Optional configurable custom error pages (for example 404/500)
 - [ ] Improve end-to-end integration tests
 
 <p align="right">(<a href="#pear">back to top</a>)</p>
